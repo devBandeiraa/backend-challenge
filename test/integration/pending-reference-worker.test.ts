@@ -62,7 +62,7 @@ describe('referência chega depois', () => {
     const refund = wagerCommand(w, { kind: 'REFUND', money: { amount: '30.00', currency: 'BRL' }, referenceExternalTransactionId: bet.externalTransactionId });
 
     const pending = await app.processTransaction.execute(refund);
-    expect(pending.status as string).toBe('PENDING_REFERENCE');
+    expect(pending.status).toBe('PENDING_REFERENCE');
     expect(await app.processTransaction.execute(bet)).toMatchObject({ status: 'PROCESSED', balance: { amount: '70.00' } });
 
     expect(await resolve(pending.transactionId)).toMatchObject({ status: 'PROCESSED' });

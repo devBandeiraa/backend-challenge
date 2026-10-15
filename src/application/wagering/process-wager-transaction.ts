@@ -29,7 +29,8 @@ export interface SubmitWagerTransactionCommand {
 
 export interface WagerTransactionOutcome {
   transactionId: string;
-  status: WagerTransactionStatus;
+  /** União de literais ("PROCESSED" | ...): formato do contrato de saída. */
+  status: `${WagerTransactionStatus}`;
   /** Saldo observado quando a transação ficou terminal (moeda da wallet). Ausente em PENDING_REFERENCE/FAILED. */
   balance: MoneyProps | undefined;
   failureCode: FailureCode | undefined;
