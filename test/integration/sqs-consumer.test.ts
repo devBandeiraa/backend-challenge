@@ -1,0 +1,273 @@
+/**
+ * Consumer SQS contra LocalStack e Postgres REAIS: inbox/redelivery, envelope tolerante + data
+ * estrito, erros de negócio (ack), permanentes (DLQ), transitórios (retry com backoff) e, após
+ * o limite, FAILED gravado ANTES da DLQ. Shutdown cooperativo.
+ */
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
+import { ExponentialBackoff } from '../../src/domain/messaging/backoff-policy';
+import { createLogger } from '../../src/infrastructure/observability/logger';
+import { type ConsumerOptions, WagerTransactionConsumer } from '../../src/interfaces/sqs/wager-transaction.consumer';
+import {
+  type AppContext,
+  assertLedgerInvariant,
+  countRows,
+  createAppContext,
+  messageData,
+  openTestWallet,
+  wagerCommand,
+  walletBalance,
+} from '../support/app-context';
+import { createTestQueues, drain, type SqsGateway, waitFor, wagerMessage } from '../support/sqs';
+import type { SQSClient } from '@aws-sdk/client-sqs';
+
+let app: AppContext;
+let gateway: SqsGateway;
+let client: SQSClient;
+const logger = createLogger({ test: 'sqs-consumer' });
+logger.level = 'silent';
+const touched: string[] = [];
+const running: WagerTransactionConsumer[] = [];
+
+beforeAll(async () => {
+  app = await createAppContext({ uow: { maxAttempts: 1, lockTimeoutMs: 200 } });
+});
+// Filas novas por teste: nenhuma mensagem de um teste vaza para outro.
+beforeEach(async () => {
+  ({ gateway, client } = await createTestQueues('consumer'));
+});
+afterEach(async () => {
+  await Promise.all(running.splice(0).map((c) => c.stop()));
+});
+afterAll(async () => {
+  for (const id of touched) await assertLedgerInvariant(app.orm, id);
+  await app.close();
+});
+
+function consumer(overrides: Partial<ConsumerOptions> = {}) {
+  const c = new WagerTransactionConsumer(gateway, app.processTransaction, app.metrics, logger, {
+    consumerName: 'test-consumer',
+    maxAttempts: 3,
+    waitTimeSeconds: 1,
+    visibilityTimeoutSeconds: 30,
+    batchSize: 10,
+    shutdownGraceMs: 10_000,
+    retryBackoff: new ExponentialBackoff({ baseMs: 1_000, factor: 1, maxMs: 1_000, jitterRatio: 0 }),
+    ...overrides,
+  });
+  running.push(c);
+  return c;
+}
+
+async function wallet(amount = '100.00') {
+  const w = await openTestWallet(app, amount);
+  touched.push(w.id);
+  return w;
+}
+
+async function send(body: string, groupId: string) {
+  await gateway.sendToInput(body, groupId, crypto.randomUUID());
+}
+
+async function statusOf(idempotencyKey: string) {
+  const [row] = await app.orm.em
+    .fork()
+    .execute<{ status: string; failure_code: string | null }[]>(
+      `SELECT status, failure_code FROM wager_transactions WHERE idempotency_key = ?`,
+      [idempotencyKey],
+    );
+  return row;
+}
+
+describe('processamento', () => {
+  test('mensagem do enunciado é processada pelo MESMO use case, gravada na inbox e removida da fila (ack após commit)', async () => {
+    const w = await wallet('100.00');
+    const cmd = wagerCommand(w, { money: { amount: '25.00', currency: 'BRL' } });
+    const msg = wagerMessage(messageData(cmd));
+    await send(msg.body, w.id);
+    consumer().start();
+
+    await waitFor(async () => (await statusOf(cmd.idempotencyKey))?.status === 'PROCESSED');
+    expect(await walletBalance(app.orm, w.id)).toBe('75.00');
+    expect(await countRows(app.orm, `inbox_messages WHERE message_id = ? AND processed_at IS NOT NULL`, [msg.messageId])).toBe(1);
+    await waitFor(async () => (await drain(client, gateway.urls.input, 300)).length === 0 || undefined);
+  });
+
+  test('envelope tolerante: campos extras e sem type/occurredAt; sem messageId usa o id do SQS', async () => {
+    const w = await wallet();
+    const cmd = wagerCommand(w);
+    await send(JSON.stringify({ data: messageData(cmd), traceparent: '00-abc', schemaVersion: 7 }), w.id);
+    consumer().start();
+    await waitFor(async () => (await statusOf(cmd.idempotencyKey))?.status === 'PROCESSED');
+  });
+
+  test('redelivery da MESMA mensagem (mesmo messageId): inbox detecta, nenhum efeito novo', async () => {
+    const w = await wallet('100.00');
+    const cmd = wagerCommand(w, { money: { amount: '10.00', currency: 'BRL' } });
+    const msg = wagerMessage(messageData(cmd));
+    await send(msg.body, w.id);
+    await send(msg.body, w.id); // produtor reenviou (outro dedup id no SQS, mesmo messageId lógico)
+    const c = consumer();
+    c.start();
+    await waitFor(async () => (await countRows(app.orm, `inbox_messages WHERE message_id = ?`, [msg.messageId])) === 1 || undefined);
+    await Bun.sleep(1_500);
+    expect(await walletBalance(app.orm, w.id)).toBe('90.00');
+    expect(await countRows(app.orm, `wallet_ledger_entries l JOIN wager_transactions t ON t.id = l.transaction_id WHERE t.idempotency_key = ?`, [cmd.idempotencyKey])).toBe(1);
+    expect((await app.metrics.duplicates.get()).values.find((v) => v.labels.layer === 'inbox')?.value).toBeGreaterThanOrEqual(1);
+  });
+
+  test('mesma operação com OUTRO messageId: inbox não pega, idempotency key pega (replay)', async () => {
+    const w = await wallet('100.00');
+    const cmd = wagerCommand(w, { money: { amount: '10.00', currency: 'BRL' } });
+    await send(wagerMessage(messageData(cmd)).body, w.id);
+    await send(wagerMessage(messageData(cmd)).body, w.id);
+    consumer().start();
+    await waitFor(async () => (await countRows(app.orm, `inbox_messages i JOIN wager_transactions t ON t.id = i.transaction_id WHERE t.idempotency_key = ?`, [cmd.idempotencyKey])) === 2 || undefined);
+    expect(await walletBalance(app.orm, w.id)).toBe('90.00');
+  });
+
+  test('rejeição de negócio (sem saldo) e WALLET_NOT_FOUND: ack, sem DLQ', async () => {
+    const w = await wallet('5.00');
+    const cmd = wagerCommand(w, { money: { amount: '10.00', currency: 'BRL' } });
+    const ghost = wagerCommand({ id: crypto.randomUUID(), playerId: crypto.randomUUID() });
+    await send(wagerMessage(messageData(cmd)).body, w.id);
+    await send(wagerMessage(messageData(ghost)).body, ghost.walletId);
+    consumer().start();
+    await waitFor(async () => (await statusOf(cmd.idempotencyKey))?.failure_code === 'INSUFFICIENT_FUNDS');
+    await Bun.sleep(1_500);
+    expect(await drain(client, gateway.urls.deadLetter, 500)).toHaveLength(0);
+    expect(await drain(client, gateway.urls.input, 300)).toHaveLength(0);
+  });
+});
+
+describe('erros permanentes → DLQ', () => {
+  test.each([
+    ['JSON inválido', '{not json', 'invalid_json'],
+    ['data com campo desconhecido (data é estrito)', JSON.stringify({ data: { ...messageData(wagerCommand({ id: crypto.randomUUID(), playerId: crypto.randomUUID() })), extra: 1 } }), 'invalid_data'],
+    // a forma passa no zod (é string); o conteúdo é validado pelo Money do domínio
+    ['data com valor "25.5" (escala fixa)', JSON.stringify({ data: { ...messageData(wagerCommand({ id: crypto.randomUUID(), playerId: crypto.randomUUID() })), money: { amount: '25.5', currency: 'BRL' } } }), 'INVALID_MONEY'],
+    ['data sem idempotencyKey', JSON.stringify({ data: (({ idempotencyKey: _k, ...d }) => d)(messageData(wagerCommand({ id: crypto.randomUUID(), playerId: crypto.randomUUID() }))) }), 'invalid_data'],
+  ])('%s', async (_label, body, reason) => {
+    await send(body, 'g-' + crypto.randomUUID());
+    consumer().start();
+    const dlq = await waitFor(async () => {
+      const got = await drain(client, gateway.urls.deadLetter, 500);
+      return got.length > 0 ? got : undefined;
+    });
+    expect(dlq[0]!.attributes.failureReason).toBe(reason);
+    expect(dlq[0]!.body).toBe(body); // corpo original preservado para inspeção/redrive
+  });
+
+  test('mesmo messageId com conteúdo DIFERENTE: INBOX_PAYLOAD_MISMATCH → DLQ', async () => {
+    const w = await wallet();
+    const first = wagerCommand(w);
+    const msgId = `msg-${crypto.randomUUID()}`;
+    await send(wagerMessage(messageData(first), msgId).body, w.id);
+    await send(wagerMessage(messageData(wagerCommand(w)), msgId).body, w.id);
+    consumer().start();
+    const dlq = await waitFor(async () => {
+      const got = await drain(client, gateway.urls.deadLetter, 500);
+      return got.length > 0 ? got : undefined;
+    });
+    expect(dlq[0]!.attributes.failureReason).toBe('INBOX_PAYLOAD_MISMATCH');
+  });
+});
+
+describe('transitório → retry com backoff → limite → FAILED antes da DLQ', () => {
+  test('wallet travada por outra transação: retries medidos, FAILED gravado, DLQ com motivo; replay devolve FAILED', async () => {
+    const w = await wallet('100.00');
+    const cmd = wagerCommand(w, { money: { amount: '10.00', currency: 'BRL' } });
+    const msg = wagerMessage(messageData(cmd));
+
+    // FOR NO KEY UPDATE bloqueia o lock da wallet no caminho de processamento (55P03 após 200ms),
+    // mas NÃO bloqueia o INSERT do FAILED (que só precisa de KEY SHARE pela FK).
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    let locked!: () => void;
+    const isLocked = new Promise<void>((r) => (locked = r));
+    const holder = app.orm.em.fork().transactional(async (em) => {
+      await em.execute(`SELECT id FROM wallets WHERE id = ? FOR NO KEY UPDATE`, [w.id]);
+      locked();
+      await released;
+    });
+    await isLocked;
+
+    const retriesBefore = (await app.metrics.sqsRetries.get()).values[0]?.value ?? 0;
+    await send(msg.body, w.id);
+    consumer({ maxAttempts: 3 }).start();
+
+    const dlq = await waitFor(async () => {
+      const got = await drain(client, gateway.urls.deadLetter, 500);
+      return got.length > 0 ? got : undefined;
+    }, 30_000);
+    release();
+    await holder;
+
+    expect(dlq[0]!.attributes.failureReason).toBe('retries_exhausted');
+    expect(dlq[0]!.attributes.receiveCount).toBe('3');
+    expect((await app.metrics.sqsRetries.get()).values[0]!.value - retriesBefore).toBe(2);
+    expect(await statusOf(cmd.idempotencyKey)).toEqual({ status: 'FAILED', failure_code: 'PROCESSING_FAILED' });
+    expect(await countRows(app.orm, `inbox_messages WHERE message_id = ? AND processed_at IS NOT NULL`, [msg.messageId])).toBe(1);
+    expect(await walletBalance(app.orm, w.id)).toBe('100.00'); // nada aplicado
+
+    // FAILED é terminal para a key: reenviar devolve o mesmo resultado (HTTP: 422 PROCESSING_FAILED)
+    const replay = await app.processTransaction.execute(cmd);
+    expect(replay).toMatchObject({ status: 'FAILED', failureCode: 'PROCESSING_FAILED', idempotentReplay: true });
+  }, 40_000);
+});
+
+describe('shutdown (SIGTERM)', () => {
+  test('stop() conclui a mensagem em andamento e devolve à fila as que não começaram', async () => {
+    const w = await wallet('100.00');
+    const inFlight = wagerCommand(w, { money: { amount: '1.00', currency: 'BRL' } });
+    const waiting = wagerCommand(w, { money: { amount: '2.00', currency: 'BRL' } });
+
+    // Segura a wallet para a 1ª mensagem ficar "em andamento" (lock_timeout maior que a espera).
+    const slowApp = await createAppContext({ poolMax: 5, uow: { maxAttempts: 1, lockTimeoutMs: 5_000 } });
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    let locked!: () => void;
+    const isLocked = new Promise<void>((r) => (locked = r));
+    const holder = app.orm.em.fork().transactional(async (em) => {
+      await em.execute(`SELECT id FROM wallets WHERE id = ? FOR NO KEY UPDATE`, [w.id]);
+      locked();
+      await released;
+    });
+    await isLocked;
+
+    await send(wagerMessage(messageData(inFlight)).body, w.id);
+    await send(wagerMessage(messageData(waiting)).body, w.id);
+    const c = new WagerTransactionConsumer(gateway, slowApp.processTransaction, slowApp.metrics, logger, {
+      consumerName: 'test-consumer',
+      maxAttempts: 3,
+      waitTimeSeconds: 1,
+      visibilityTimeoutSeconds: 30, // sem o release explícito, a 2ª só voltaria após 30s
+      batchSize: 10,
+      shutdownGraceMs: 10_000,
+    });
+    c.start();
+    // a 1ª mensagem já inseriu a transação (PENDING, não confirmada) e espera o lock da wallet
+    await waitFor(async () => {
+      const [row] = await app.orm.em.fork().execute<{ n: string }[]>(
+        `SELECT count(*)::text AS n FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND datname = current_database()`,
+      );
+      return Number(row?.n) > 0 || undefined;
+    }, 10_000);
+
+    const stopping = c.stop(); // "SIGTERM"
+    await Bun.sleep(300);
+    release(); // o trabalho em andamento consegue terminar
+    await holder;
+    await stopping;
+
+    expect((await statusOf(inFlight.idempotencyKey))?.status).toBe('PROCESSED');
+    expect(await statusOf(waiting.idempotencyKey)).toBeUndefined(); // não começou
+
+    // A não iniciada voltou para a fila na hora (visibility 0): outro consumer pega em segundos.
+    const startedAt = Date.now();
+    consumer().start();
+    await waitFor(async () => (await statusOf(waiting.idempotencyKey))?.status === 'PROCESSED', 10_000);
+    expect(Date.now() - startedAt).toBeLessThan(10_000);
+    expect(await walletBalance(app.orm, w.id)).toBe('97.00');
+    await slowApp.close();
+  }, 30_000);
+});

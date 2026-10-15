@@ -1,0 +1,3 @@
+[test]
+# Testes de integração usam Postgres e SQS reais (long polling, backoff em segundos).
+timeout = 60000
