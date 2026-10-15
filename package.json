@@ -13,7 +13,9 @@
     "test": "bun test",
     "test:unit": "bun test test/unit",
     "test:integration": "bun test test/integration test/concurrency",
-    "infra:up": "docker compose up -d postgres localstack",
+    "infra:up": "docker compose up -d postgres localstack migrate sqs-init",
+    "stack:up": "docker compose up -d --build",
+    "queues:provision": "bun run src/infrastructure/messaging/sqs/provision-queues.ts",
     "infra:down": "docker compose down -v"
   },
   "dependencies": {

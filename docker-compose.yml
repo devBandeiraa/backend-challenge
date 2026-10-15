@@ -1,5 +1,23 @@
 name: wagering
 
+# Emulador SQS selecionado por profile (default em .env: COMPOSE_PROFILES=localstack).
+#   docker compose up -d                              -> LocalStack 4.14.0
+#   COMPOSE_PROFILES=ministack docker compose up -d   -> MiniStack
+# Os dois respondem pelo alias de rede "sqs", então app e sqs-init não mudam.
+
+x-sqs-healthcheck: &sqs-healthcheck
+  interval: 2s
+  timeout: 3s
+  retries: 60
+
+x-app-env: &app-env
+  DATABASE_URL: postgresql://wagering:wagering@postgres:5432/wagering
+  SQS_ENDPOINT: http://sqs:4566
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+  LOG_LEVEL: info
+
 services:
   postgres:
     image: postgres:17.11-alpine
@@ -7,9 +25,9 @@ services:
       POSTGRES_USER: wagering
       POSTGRES_PASSWORD: wagering
       POSTGRES_DB: wagering
-    # 5442 no host para não colidir com outros Postgres locais (5432–5434 são comuns).
+    # 5442 no host para não colidir com outros Postgres locais.
     ports: ["5442:5432"]
-    # max_connections folgado: 3+ réplicas × pool + processos de teste concorrentes.
+    # max_connections folgado para 3+ réplicas × pool + processos de teste concorrentes.
     command: ["postgres", "-c", "max_connections=300", "-c", "deadlock_timeout=200ms"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U wagering -d wagering"]
@@ -20,22 +38,73 @@ services:
       - pgdata:/var/lib/postgresql/data
 
   localstack:
-    # 4.14.0 é a última imagem community que não exige LOCALSTACK_AUTH_TOKEN
-    # (as releases 2026.x terminam com exit 55 sem licença). Ver ARCHITECTURE.md.
+    # Imagem community PRÉ-consolidação, congelada em 4.14.0: as releases 2026.x exigem
+    # LOCALSTACK_AUTH_TOKEN (exit 55 sem licença). Ver ARCHITECTURE.md.
     image: localstack/localstack:4.14.0
+    profiles: ["localstack"]
     environment:
       SERVICES: sqs
       AWS_DEFAULT_REGION: us-east-1
       SQS_ENDPOINT_STRATEGY: path
     ports: ["4566:4566"]
+    networks:
+      default:
+        aliases: [sqs]
     healthcheck:
-      # "ready" só depois que o init script criou as filas.
-      test: ["CMD-SHELL", "test -f /tmp/queues-ready"]
-      interval: 2s
+      <<: *sqs-healthcheck
+      test: ["CMD-SHELL", "curl -sf http://localhost:4566/_localstack/health | grep -q '\"sqs\": \"\\(available\\|running\\)\"'"]
+
+  ministack:
+    # Alternativa MIT aceita pelo enunciado. Mesmo contrato de porta e alias.
+    image: ministackorg/ministack:1.5.27
+    profiles: ["ministack"]
+    ports: ["4566:4566"]
+    networks:
+      default:
+        aliases: [sqs]
+    healthcheck:
+      <<: *sqs-healthcheck
+      test: ["CMD-SHELL", "python3 -c \"import urllib.request; urllib.request.urlopen('http://localhost:4566/', timeout=2)\" 2>/dev/null || wget -q -O /dev/null http://localhost:4566/ 2>/dev/null"]
+
+  migrate:
+    build: { context: ., dockerfile: docker/app.Dockerfile }
+    command: ["bun", "run", "src/infrastructure/persistence/migrate.ts", "up"]
+    environment: *app-env
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  sqs-init:
+    build: { context: ., dockerfile: docker/app.Dockerfile }
+    command: ["bun", "run", "src/infrastructure/messaging/sqs/provision-queues.ts"]
+    environment: *app-env
+    depends_on:
+      localstack: { condition: service_healthy, required: false }
+      ministack: { condition: service_healthy, required: false }
+    restart: on-failure:10
+
+  app:
+    build: { context: ., dockerfile: docker/app.Dockerfile }
+    environment: *app-env
+    deploy:
+      replicas: 3
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      sqs-init: { condition: service_completed_successfully }
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q -O /dev/null http://localhost:3000/health/live || exit 1"]
+      interval: 5s
       timeout: 3s
-      retries: 60
+      retries: 10
+
+  nginx:
+    # Ponto de entrada HTTP único que distribui entre as réplicas (DNS do compose resolve "app" para todas).
+    image: nginx:1.29.8-alpine
+    ports: ["8088:80"]
     volumes:
-      - ./docker/localstack/init-queues.sh:/etc/localstack/init/ready.d/init-queues.sh:ro
+      - ./docker/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      app: { condition: service_healthy }
 
 volumes:
   pgdata:
