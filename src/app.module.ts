@@ -8,11 +8,12 @@ import { ProcessWagerTransactionUseCase } from './application/wagering/process-w
 import { ResolvePendingReferencesUseCase } from './application/wagering/resolve-pending-references';
 import type { PendingReferencePolicy } from './application/wagering/settle-transaction';
 import { OpenWalletUseCase } from './application/wallets/open-wallet';
+import { ReconcileWalletUseCase } from './application/wallets/reconcile-wallet';
 import { ExponentialBackoff } from './domain/messaging/backoff-policy';
 import { APP_CONFIG, type AppConfig, assertConsumerTiming, loadConfig } from './infrastructure/config';
 import { createSqsClient } from './infrastructure/messaging/sqs/sqs-config';
 import { SQS_GATEWAY, SqsGateway } from './infrastructure/messaging/sqs/sqs-gateway';
-import { createLogger, type Logger } from './infrastructure/observability/logger';
+import { createLogger, type Logger, PinoNestLogger } from './infrastructure/observability/logger';
 import { AppMetrics, METRICS } from './infrastructure/observability/metrics';
 import { buildOrmConfig } from './infrastructure/persistence/mikro-orm.config';
 import { MikroOrmUnitOfWork } from './infrastructure/persistence/mikro-orm-unit-of-work';
@@ -21,7 +22,7 @@ import { BackgroundProcesses } from './infrastructure/workers/background-process
 import { OutboxPublisher } from './infrastructure/workers/outbox-publisher';
 import { PollingWorker } from './infrastructure/workers/polling-worker';
 import { ProviderAuthGuard } from './interfaces/http/auth.guard';
-import { correlationMiddleware } from './interfaces/http/correlation';
+import { correlationMiddleware, requestLogMiddleware } from './interfaces/http/correlation';
 import { HttpErrorFilter } from './interfaces/http/error-filter';
 import { HealthController } from './interfaces/http/health.controller';
 import { MetricsController } from './interfaces/http/metrics.controller';
@@ -30,6 +31,7 @@ import { WalletsController } from './interfaces/http/wallets.controller';
 import { WagerTransactionConsumer } from './interfaces/sqs/wager-transaction.consumer';
 
 export const LOGGER = Symbol('Logger');
+export const NEST_LOGGER = Symbol('NestLogger');
 const PENDING_POLICY = Symbol('PendingReferencePolicy');
 
 // Use cases são classes puras (sem decorators do Nest): o Nest só as monta via factory.
@@ -53,6 +55,26 @@ const useCases = [
     inject: [UNIT_OF_WORK, CLOCK, ID_GENERATOR, PENDING_POLICY],
   },
   { provide: WalletQueries, useFactory: (uow: UnitOfWork) => new WalletQueries(uow), inject: [UNIT_OF_WORK] },
+  {
+    provide: ReconcileWalletUseCase,
+    useFactory: (uow: UnitOfWork, metrics: AppMetrics, logger: Logger) =>
+      new ReconcileWalletUseCase(uow, {
+        // Divergência: log de erro (sem saldos completos, só a diferença) + métrica. Nada é corrigido.
+        onMismatch: (r) => {
+          metrics.reconciliationMismatches.inc();
+          logger.error({
+            msg: 'reconciliation mismatch',
+            walletId: r.walletId,
+            difference: r.difference.amount,
+            currency: r.difference.currency,
+            walletVersion: r.walletVersion,
+            ledgerVersion: r.ledgerVersion,
+            checkedEntries: r.checkedEntries,
+          });
+        },
+      }),
+    inject: [UNIT_OF_WORK, METRICS, LOGGER],
+  },
 ];
 
 const messaging = [
@@ -118,7 +140,10 @@ const messaging = [
             'pending-reference',
             async () => {
               const results = await resolvePending.runOnce(config.pendingReference.batchSize);
-              for (const r of results) metrics.pendingReferenceResolutions.inc({ result: r.status });
+              for (const r of results) {
+                metrics.pendingReferenceResolutions.inc({ result: r.status });
+                logger.info({ msg: 'pending reference attempt', transactionId: r.transactionId, status: r.status });
+              }
               return results.length;
             },
             config.pendingReference.intervalMs,
@@ -166,20 +191,27 @@ const messaging = [
     },
     {
       provide: UNIT_OF_WORK,
-      useFactory: (orm: MikroORM, config: AppConfig, metrics: AppMetrics) =>
+      useFactory: (orm: MikroORM, config: AppConfig, metrics: AppMetrics, logger: Logger) =>
         new MikroOrmUnitOfWork(
           orm,
           { maxAttempts: config.db.uowMaxAttempts, lockTimeoutMs: config.db.lockTimeoutMs },
           {
-            onRetry: ({ sqlState }) => metrics.lockConflicts.inc({ sqlstate: sqlState ?? 'unknown' }),
-            onExhausted: () => metrics.retriesExhausted.inc(),
+            onRetry: ({ attempt, sqlState, constraint }) => {
+              metrics.lockConflicts.inc({ sqlstate: sqlState ?? 'unknown' });
+              logger.warn({ msg: 'transaction retry after concurrency conflict', attempt, sqlState, constraint });
+            },
+            onExhausted: ({ attempts, sqlState }) => {
+              metrics.retriesExhausted.inc();
+              logger.error({ msg: 'transaction retries exhausted', attempts, sqlState });
+            },
           },
         ),
-      inject: [MikroORM, APP_CONFIG, METRICS],
+      inject: [MikroORM, APP_CONFIG, METRICS, LOGGER],
     },
     ...useCases,
     ...messaging,
     { provide: APP_GUARD, useClass: ProviderAuthGuard },
+    { provide: NEST_LOGGER, useFactory: (logger: Logger) => new PinoNestLogger(logger.child({ component: 'nest' })), inject: [LOGGER] },
   ],
 })
 export class AppModule {}
@@ -192,7 +224,9 @@ export function configureHttp(app: INestApplication): void {
     res.setHeader('X-Instance-Id', instanceId);
     next();
   });
+  const logger = app.get<Logger>(LOGGER);
   app.use(correlationMiddleware);
-  app.useGlobalFilters(new HttpErrorFilter());
+  app.use(requestLogMiddleware(logger));
+  app.useGlobalFilters(new HttpErrorFilter(logger));
   app.enableShutdownHooks();
 }

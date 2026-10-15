@@ -1,6 +1,7 @@
 import type { InboxMessage } from '../../domain/messaging/inbox-message';
 import type { OutboxMessage } from '../../domain/messaging/outbox-message';
 import type { WagerTransaction } from '../../domain/wagering/wager-transaction';
+import type { Money } from '../../domain/shared/money';
 import type { Wallet } from '../../domain/wallet/wallet';
 import type { WalletLedgerEntry } from '../../domain/wallet/wallet-ledger-entry';
 
@@ -21,6 +22,16 @@ export interface WalletRepository {
   lockById(id: string): Promise<Wallet | undefined>;
   /** Persiste saldo/version/updatedAt após debit/credit. */
   saveBalance(wallet: Wallet): Promise<void>;
+  /** Wallet + totais do ledger lidos numa ÚNICA instrução SQL (snapshot consistente, sem lock). */
+  reconciliationSnapshot(walletId: string): Promise<ReconciliationSnapshot | undefined>;
+}
+
+export interface ReconciliationSnapshot {
+  wallet: Wallet;
+  credits: Money;
+  debits: Money;
+  entries: number;
+  lastLedgerVersion: number | undefined;
 }
 
 export interface WagerTransactionRepository {

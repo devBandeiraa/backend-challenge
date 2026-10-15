@@ -5,6 +5,7 @@ import type {
   LedgerPage,
   LedgerRepository,
   OutboxRepository,
+  ReconciliationSnapshot,
   TransactionScope,
   WagerTransactionRepository,
   WalletRepository,
@@ -13,6 +14,7 @@ import { WalletAlreadyExistsError } from '../../application/errors';
 import type { InboxMessage } from '../../domain/messaging/inbox-message';
 import type { OutboxMessage } from '../../domain/messaging/outbox-message';
 import type { WagerTransaction } from '../../domain/wagering/wager-transaction';
+import { Money } from '../../domain/shared/money';
 import type { Wallet } from '../../domain/wallet/wallet';
 import type { WalletLedgerEntry } from '../../domain/wallet/wallet-ledger-entry';
 import {
@@ -65,6 +67,35 @@ class MikroOrmWalletRepository implements WalletRepository {
       { id: wallet.id },
       { balance: wallet.balance.amount, version: wallet.version, updatedAt: wallet.updatedAt },
     );
+  }
+
+  async reconciliationSnapshot(walletId: string): Promise<ReconciliationSnapshot | undefined> {
+    // Uma instrução = um snapshot: saldo e agregados do ledger vistos no mesmo instante.
+    // Somas em NUMERIC e devolvidas como texto: nenhum valor passa por number.
+    const rows = await this.em.execute<
+      (Record<string, unknown> & { credits: string; debits: string; entries: string; last_version: number | null })[]
+    >(
+      `SELECT w.*,
+              COALESCE(SUM(l.amount) FILTER (WHERE l.direction = 'CREDIT'), 0)::numeric(19,2)::text AS credits,
+              COALESCE(SUM(l.amount) FILTER (WHERE l.direction = 'DEBIT'), 0)::numeric(19,2)::text  AS debits,
+              COUNT(l.id)::text AS entries,
+              MAX(l.wallet_version) AS last_version
+         FROM wallets w
+         LEFT JOIN wallet_ledger_entries l ON l.wallet_id = w.id
+        WHERE w.id = ?
+        GROUP BY w.id`,
+      [walletId],
+    );
+    const row = rows[0];
+    if (!row) return undefined;
+    const wallet = toWallet(this.em.map(WalletRecord, row));
+    return {
+      wallet,
+      credits: Money.from({ amount: row.credits, currency: wallet.currency }),
+      debits: Money.from({ amount: row.debits, currency: wallet.currency }),
+      entries: Number(row.entries),
+      lastLedgerVersion: row.last_version ?? undefined,
+    };
   }
 }
 
