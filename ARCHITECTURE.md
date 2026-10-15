@@ -78,7 +78,7 @@ Todos os testes usam **Postgres e LocalStack reais**. "e2e" = `bun run test:mult
 |---|---|---|
 | `number` para dinheiro | `Money` (decimal.js, string na entrada e na saída), `NUMERIC(19,2)` mapeado como string, `canonicalJson` proíbe `number` | [money.ts](src/domain/shared/money.ts), [money.test.ts](test/unit/domain/money.test.ts), [payload-hash.test.ts](test/unit/application/payload-hash.test.ts) ("rejeita number"), [records.ts](src/infrastructure/persistence/schemas/records.ts) |
 | Saldo negativo por race | lock por wallet + `CHECK (balance >= 0)` + `CHECK` do ledger + política de saldo sob lock | [hot-wallet.test.ts](test/concurrency/hot-wallet.test.ts) (100/80/80 ×20; 200 apostas em 150.00), [schema-constraints.test.ts](test/integration/schema-constraints.test.ts) ("CHECK balance >= 0") |
-| Débito/crédito duplicado | insert-first com `UNIQUE (idempotency_key)` e `UNIQUE (provider_id, external_transaction_id)`, `UNIQUE (transaction_id, wallet_id)` no ledger, inbox, índice de reversão única | [same-operation.test.ts](test/concurrency/same-operation.test.ts) (50× → 1 débito), [crash-after-commit.test.ts](test/concurrency/crash-after-commit.test.ts), [restart-consistency.test.ts](test/recovery/restart-consistency.test.ts), e2e "50x" |
+| Débito/crédito duplicado | insert-first com `UNIQUE (provider_id, idempotency_key)` e `UNIQUE (provider_id, external_transaction_id)`, `UNIQUE (transaction_id, wallet_id)` no ledger, inbox, índice de reversão única | [same-operation.test.ts](test/concurrency/same-operation.test.ts) (50× → 1 débito), [crash-after-commit.test.ts](test/concurrency/crash-after-commit.test.ts), [restart-consistency.test.ts](test/recovery/restart-consistency.test.ts), e2e "50x" |
 | Idempotência só em memória | só existe no banco: unicidade + snapshot do resultado na própria linha | [use-cases.test.ts](test/integration/use-cases.test.ts) (replay devolve saldo daquele momento), [restart-consistency.test.ts](test/recovery/restart-consistency.test.ts) (replay após restart) |
 | Correto só com 1 instância | nenhum estado em memória; locks e unicidade no Postgres; `SKIP LOCKED` nos workers | [same-operation.test.ts](test/concurrency/same-operation.test.ts) (3 pools), e2e (3 réplicas, `X-Instance-Id`), [pending-reference-worker.test.ts](test/integration/pending-reference-worker.test.ts) "duas instâncias", [outbox-publisher.test.ts](test/integration/outbox-publisher.test.ts) "DOIS publishers" |
 | Publicar evento antes do commit | eventos só são gravados na outbox, na mesma transação; o publisher só lê linhas confirmadas | [settle-transaction.ts](src/application/wagering/settle-transaction.ts), [outbox-publisher.test.ts](test/integration/outbox-publisher.test.ts) |
@@ -308,7 +308,7 @@ Cada uma das garantias abaixo tem teste só com SQL em [schema-constraints.test.
 |---|---|
 | Saldo nunca negativo | `CHECK (balance >= 0)`; `CHECK` de saldos não negativos no ledger |
 | Uma wallet por player+moeda | `UNIQUE (player_id, currency)` |
-| Idempotência | `UNIQUE (idempotency_key)`, `UNIQUE (provider_id, external_transaction_id)` |
+| Idempotência | `UNIQUE (provider_id, idempotency_key)` (migration 007), `UNIQUE (provider_id, external_transaction_id)` |
 | No máximo um lançamento por transação | `UNIQUE (transaction_id, wallet_id)` no ledger |
 | Aritmética do lançamento | `CHECK (balance_before ± amount = balance_after)` |
 | Ledger append-only | trigger bloqueia UPDATE, DELETE e TRUNCATE (`WL001`) |
@@ -347,7 +347,12 @@ Cada uma das garantias abaixo tem teste só com SQL em [schema-constraints.test.
 ## 6. Idempotência
 
 - **Fonte da verdade:** o header `Idempotency-Key` (HTTP) ou `data.idempotencyKey` (SQS), gravado em
-  `UNIQUE (idempotency_key)`. Nada fica em memória.
+  `UNIQUE (provider_id, idempotency_key)`. Nada fica em memória.
+- **Escopo por provedor:** a key é escolhida pelo provedor, e dois provedores podem gerar a mesma
+  (contadores, ids de rodada). Com unicidade global, a operação legítima de um seria bloqueada com 409
+  pela do outro. Por isso a unicidade e o lookup do replay são por `(providerId, key)` (migration 007).
+  Prova: [http-api.test.ts](test/integration/http-api.test.ts) ("escopo por provedor") e
+  [schema-constraints.test.ts](test/integration/schema-constraints.test.ts).
 - **payloadHash:** `hex(SHA-256(UTF-8(canonicalJson({ v: "wager-payload/v1", ...campos de negócio }))))`.
   - Campos de negócio: providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind,
     money, referenceExternalTransactionId.
@@ -357,8 +362,8 @@ Cada uma das garantias abaixo tem teste só com SQL em [schema-constraints.test.
 
 | Situação após `ON CONFLICT DO NOTHING` | Resposta |
 |---|---|
-| mesma key, mesmo hash | replay do resultado gravado (status e corpo originais, `idempotentReplay: true`) |
-| mesma key, hash diferente | 409 `IDEMPOTENCY_KEY_PAYLOAD_MISMATCH` |
+| mesmo provedor, mesma key, mesmo hash | replay do resultado gravado (status e corpo originais, `idempotentReplay: true`) |
+| mesmo provedor, mesma key, hash diferente | 409 `IDEMPOTENCY_KEY_PAYLOAD_MISMATCH` |
 | mesmo `(provider, externalId)`, outra key | 409 `EXTERNAL_TRANSACTION_ID_CONFLICT` |
 
 **No SQS, duas camadas:**

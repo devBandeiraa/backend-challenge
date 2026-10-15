@@ -108,6 +108,20 @@ describe('POST /wagering/transactions', () => {
     expect([otherKey.status, otherKey.body.error.code]).toEqual([409, 'EXTERNAL_TRANSACTION_ID_CONFLICT']);
   });
 
+  test('Idempotency-Key tem escopo por provedor: provider-b com a MESMA key de provider-a é processado normalmente', async () => {
+    const w = await createWallet('100.00');
+    const key = `shared-key-${crypto.randomUUID()}`;
+    const a = await submit(txBody(w, { providerId: 'provider-a', money: { amount: '10.00', currency: 'BRL' } }), key);
+    const b = await submit(txBody(w, { providerId: 'provider-b', money: { amount: '20.00', currency: 'BRL' } }), key);
+    expect([a.status, a.body.status, a.body.idempotentReplay]).toEqual([200, 'PROCESSED', false]);
+    expect([b.status, b.body.status, b.body.idempotentReplay]).toEqual([200, 'PROCESSED', false]);
+    expect(b.body.transactionId).not.toBe(a.body.transactionId);
+    expect(b.body.balance.amount).toBe('70.00');
+    // cada provedor continua com o próprio replay
+    const replayB = await submit(txBody(w, { providerId: 'provider-b', externalTransactionId: (await call('GET', `/wagering/transactions/${b.body.transactionId}`)).body.externalTransactionId, money: { amount: '20.00', currency: 'BRL' } }), key);
+    expect([replayB.status, replayB.body.transactionId, replayB.body.idempotentReplay]).toEqual([200, b.body.transactionId, true]);
+  });
+
   test('422 com failureCode em rejeição de negócio (também no replay)', async () => {
     const w = await createWallet('10.00');
     const body = txBody(w, { money: { amount: '10.01', currency: 'BRL' } });

@@ -130,7 +130,8 @@ export class ProcessWagerTransactionUseCase {
     command: SubmitWagerTransactionCommand,
     payloadHash: string,
   ): Promise<WagerTransactionOutcome> {
-    const byKey = await scope.transactions.findByIdempotencyKey(command.idempotencyKey);
+    // A key tem escopo por provedor: a mesma key de outro provedor é outra operação.
+    const byKey = await scope.transactions.findByIdempotencyKey(command.providerId, command.idempotencyKey);
     if (byKey) {
       if (!byKey.matchesPayload(payloadHash)) {
         throw new IdempotencyConflictError(

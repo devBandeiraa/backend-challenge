@@ -40,17 +40,17 @@ const insertWallet = (id: string, balance = '0', player = uuid(), currency = 'BR
   [id, player, currency, balance],
 ];
 
-const insertTx = (o: { id?: string; walletId: string; kind?: string; status?: string; amount?: string; ext?: string; refExt?: string | null; refId?: string | null; extra?: string }): [string, unknown[]] => {
+const insertTx = (o: { id?: string; walletId: string; kind?: string; status?: string; amount?: string; ext?: string; key?: string; provider?: string; refExt?: string | null; refId?: string | null; extra?: string }): [string, unknown[]] => {
   const id = o.id ?? uuid();
   const ext = o.ext ?? `ext-${id}`;
   return [
     `INSERT INTO wager_transactions (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id, player_id,
        round_id, game_id, kind, amount, currency, reference_external_transaction_id, reference_transaction_id, status, correlation_id,
        processed_at, result_balance, result_balance_currency, result_wallet_version)
-     VALUES (?, 'p', ?, ?, ?, ?, ?, 'r', 'g', ?, ?, 'BRL', ?, ?, ?, 'c', ${
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'r', 'g', ?, ?, 'BRL', ?, ?, ?, 'c', ${
        (o.status ?? 'PENDING') === 'PROCESSED' ? `now(), 0, 'BRL', 1` : 'NULL, NULL, NULL, NULL'
      })`,
-    [id, ext, `key-${ext}`, HASH, o.walletId, uuid(), o.kind ?? 'BET', o.amount ?? '10', o.refExt ?? null, o.refId ?? null, o.status ?? 'PENDING'],
+    [id, o.provider ?? 'p', ext, o.key ?? `key-${ext}`, HASH, o.walletId, uuid(), o.kind ?? 'BET', o.amount ?? '10', o.refExt ?? null, o.refId ?? null, o.status ?? 'PENDING'],
   ];
 };
 
@@ -165,9 +165,16 @@ describe('wallet_ledger_entries', () => {
 });
 
 describe('wager_transactions', () => {
-  test('UNIQUE idempotency_key e (provider_id, external_transaction_id)', async () => {
+  test('UNIQUE (provider_id, idempotency_key) e (provider_id, external_transaction_id)', async () => {
     const walletId = uuid();
     expect(await sqlState([insertWallet(walletId), insertTx({ walletId, ext: 'dup' + walletId }), insertTx({ walletId, ext: 'dup' + walletId })])).toBe('23505');
+    const key = `shared-${walletId}`;
+    // mesma key no MESMO provedor: conflito
+    const w2 = uuid();
+    expect(await sqlState([insertWallet(w2), insertTx({ walletId: w2, key, provider: 'p1' }), insertTx({ walletId: w2, key, provider: 'p1' })])).toBe('23505');
+    // mesma key em provedores DIFERENTES: permitido (escopo por provedor)
+    const w3 = uuid();
+    expect(await sqlState([insertWallet(w3), insertTx({ walletId: w3, key, provider: 'p1' }), insertTx({ walletId: w3, key, provider: 'p2' })])).toBeUndefined();
   });
 
   test('REFUND/ROLLBACK exigem referência; BET não pode ter', async () => {

@@ -35,10 +35,11 @@ export interface ReconciliationSnapshot {
 }
 
 export interface WagerTransactionRepository {
-  /** INSERT ... ON CONFLICT DO NOTHING. false = já existe linha com a mesma key ou (provider, externalId). */
+  /** INSERT ... ON CONFLICT DO NOTHING. false = já existe linha com a mesma (provider, key) ou (provider, externalId). */
   insertIfAbsent(tx: WagerTransaction): Promise<boolean>;
   findById(id: string): Promise<WagerTransaction | undefined>;
-  findByIdempotencyKey(key: string): Promise<WagerTransaction | undefined>;
+  /** A key tem escopo por provedor (UNIQUE (provider_id, idempotency_key)). */
+  findByIdempotencyKey(providerId: string, key: string): Promise<WagerTransaction | undefined>;
   findByExternalId(providerId: string, externalTransactionId: string): Promise<WagerTransaction | undefined>;
   /** Persiste os campos mutáveis (status, referência, failureCode, snapshot, tentativas). */
   save(tx: WagerTransaction): Promise<void>;

@@ -103,7 +103,7 @@ class MikroOrmWagerTransactionRepository implements WagerTransactionRepository {
   constructor(private readonly em: EntityManager) {}
 
   async insertIfAbsent(tx: WagerTransaction): Promise<boolean> {
-    // Sem alvo no ON CONFLICT: cobre idempotency_key E (provider_id, external_transaction_id).
+    // Sem alvo no ON CONFLICT: cobre (provider_id, idempotency_key) E (provider_id, external_transaction_id).
     const result = await this.em
       .createQueryBuilder(WagerTransactionRecord)
       .insert(fromWagerTransaction(tx))
@@ -118,8 +118,8 @@ class MikroOrmWagerTransactionRepository implements WagerTransactionRepository {
     return row ? toWagerTransaction(row) : undefined;
   }
 
-  async findByIdempotencyKey(idempotencyKey: string) {
-    const row = await this.em.findOne(WagerTransactionRecord, { idempotencyKey }, FRESH);
+  async findByIdempotencyKey(providerId: string, idempotencyKey: string) {
+    const row = await this.em.findOne(WagerTransactionRecord, { providerId, idempotencyKey }, FRESH);
     return row ? toWagerTransaction(row) : undefined;
   }
 
