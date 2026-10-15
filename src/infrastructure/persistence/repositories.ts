@@ -1,3 +1,4 @@
+import { LockMode } from '@mikro-orm/core';
 import type { EntityManager } from '@mikro-orm/postgresql';
 import type {
   InboxRepository,
@@ -107,6 +108,17 @@ class MikroOrmWagerTransactionRepository implements WagerTransactionRepository {
       kind: { $in: ['REFUND', 'ROLLBACK'] },
     });
     return count > 0;
+  }
+
+  async claimDuePendingReference(now: Date) {
+    // LockMode.PESSIMISTIC_PARTIAL_WRITE = FOR UPDATE SKIP LOCKED: cada instância pega uma linha
+    // diferente; a usada por outra instância é pulada, não esperada.
+    const row = await this.em.findOne(
+      WagerTransactionRecord,
+      { status: 'PENDING_REFERENCE', nextAttemptAt: { $lte: now } },
+      { ...FRESH, orderBy: { nextAttemptAt: 'asc' }, lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE },
+    );
+    return row ? toWagerTransaction(row) : undefined;
   }
 }
 
