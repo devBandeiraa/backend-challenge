@@ -9,7 +9,7 @@ import { ResolvePendingReferencesUseCase } from './application/wagering/resolve-
 import type { PendingReferencePolicy } from './application/wagering/settle-transaction';
 import { OpenWalletUseCase } from './application/wallets/open-wallet';
 import { ExponentialBackoff } from './domain/messaging/backoff-policy';
-import { APP_CONFIG, type AppConfig, loadConfig } from './infrastructure/config';
+import { APP_CONFIG, type AppConfig, assertConsumerTiming, loadConfig } from './infrastructure/config';
 import { createSqsClient } from './infrastructure/messaging/sqs/sqs-config';
 import { SQS_GATEWAY, SqsGateway } from './infrastructure/messaging/sqs/sqs-gateway';
 import { createLogger, type Logger } from './infrastructure/observability/logger';
@@ -78,6 +78,7 @@ const messaging = [
       processTransaction: ProcessWagerTransactionUseCase,
       resolvePending: ResolvePendingReferencesUseCase,
     ) => {
+      if (config.roles.has('consumer')) assertConsumerTiming(config); // falha na subida, não em produção
       const consumer = config.roles.has('consumer')
         ? new WagerTransactionConsumer(gateway, processTransaction, metrics, logger.child({ component: 'sqs-consumer' }), {
             consumerName: config.sqs.consumerName,
