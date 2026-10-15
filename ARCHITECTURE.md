@@ -450,15 +450,18 @@ ainda o usar. Tabela nova numa migration futura precisa de `GRANT` explícito.
   (a mensagem foi recebida 2×).
 - **Validação no startup** ([config.ts](src/infrastructure/config.ts)): a instância **não sobe** se
   `visibilityTimeout < 1,5 × pior caso`.
-  - **`statement_timeout` por transação** (`SET LOCAL`, padrão 8 s, sempre maior que `lock_timeout`; a instância não
-    sobe se não for): espera de lock termina em `55P03` e é refeita; uma instrução travada (query lenta, rede
-    meio-aberta) termina em `57014`, tratada como indisponibilidade (503 / retry SQS) e **não** refeita na mesma
-    entrega. Vale também para a transação do publisher da outbox.
+  - **`statement_timeout` por transação** (`SET LOCAL`, padrão 15 s): proteção contra instrução **travada** (query
+    lenta, rede meio-aberta), não mecanismo de contenção. Precisa ser maior que **2 × `lock_timeout`** (a instância
+    não sobe se não for): sob contenção, um único `SELECT ... FOR NO KEY UPDATE` pode esperar duas vezes (fila do
+    lock da tupla e depois a transação que detém a linha), cada uma limitada por `lock_timeout`. Com um teto menor
+    (a 1ª versão usava 8 s), o hot-wallet de 200 apostas recebia `57014` em esperas legítimas de fila. Assim, espera
+    de lock termina em `55P03` e é refeita; só uma instrução travada termina em `57014`, tratada como
+    indisponibilidade (503 / retry SQS) e **não** refeita na mesma entrega. Vale também para o publisher da outbox.
   - Pior caso = o maior de dois caminhos, mais o backoff entre tentativas:
     - lock: (tentativas + 1 da gravação do FAILED) × `lock_timeout`;
-    - instrução lenta: (tentativas − 1) × `lock_timeout` + 2 × `statement_timeout` (a que estoura e a do FAILED).
-  - Com os defaults: max(6 × 5 s, 4 × 5 s + 2 × 8 s) + 150 ms = 36,15 s, o que exige ≥ 55 s. Por isso o padrão é **60 s**.
-  - **Teto do heartbeat:** o heartbeat renova a visibilidade só até 1,5 × pior caso (cerca de 54 s). Depois disso a
+    - instrução travada: (tentativas − 1) × `lock_timeout` + 2 × `statement_timeout` (a que estoura e a do FAILED).
+  - Com os defaults: max(6 × 5 s, 4 × 5 s + 2 × 15 s) + 150 ms = 50,15 s, o que exige ≥ 76 s. Por isso o padrão é **90 s**.
+  - **Teto do heartbeat:** o heartbeat renova a visibilidade só até 1,5 × pior caso (cerca de 75 s). Depois disso a
     mensagem volta à fila em vez de segurar o grupo FIFO da wallet para sempre; a nova entrega é deduplicada pela
     inbox. Prova: "teto do heartbeat" em [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts) e
     "statement_timeout" em [transient-failures.test.ts](test/integration/transient-failures.test.ts).

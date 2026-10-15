@@ -45,11 +45,15 @@ export function loadConfig(): AppConfig {
   for (const r of roles) if (!ALL_ROLES.includes(r)) throw new Error(`unknown APP_ROLES entry: ${r}`);
 
   const lockTimeoutMs = num('DB_LOCK_TIMEOUT_MS', 5_000);
-  const statementTimeoutMs = num('DB_STATEMENT_TIMEOUT_MS', 8_000);
-  // Espera de lock precisa terminar por lock_timeout (55P03, refeito pela unit of work), não por
-  // statement_timeout (57014, tratado como indisponibilidade e não refeito na mesma entrega).
-  if (statementTimeoutMs <= lockTimeoutMs) {
-    throw new Error(`DB_STATEMENT_TIMEOUT_MS (${statementTimeoutMs}) must be greater than DB_LOCK_TIMEOUT_MS (${lockTimeoutMs})`);
+  const statementTimeoutMs = num('DB_STATEMENT_TIMEOUT_MS', 15_000);
+  // statement_timeout é proteção contra instrução TRAVADA, não mecanismo de contenção: espera de lock
+  // precisa terminar por lock_timeout (55P03, refeito pela unit of work). Sob contenção, UM
+  // SELECT ... FOR NO KEY UPDATE pode esperar duas vezes (fila do lock da tupla + transação que detém a
+  // linha), cada uma limitada por lock_timeout; por isso o teto da instrução precisa passar de 2×.
+  if (statementTimeoutMs <= 2 * lockTimeoutMs) {
+    throw new Error(
+      `DB_STATEMENT_TIMEOUT_MS (${statementTimeoutMs}) must be greater than 2 × DB_LOCK_TIMEOUT_MS (${lockTimeoutMs})`,
+    );
   }
 
   return {
@@ -74,7 +78,7 @@ export function loadConfig(): AppConfig {
       consumerName: process.env.SQS_CONSUMER_NAME ?? 'wager-transactions-consumer',
       maxAttempts: num('SQS_CONSUMER_MAX_ATTEMPTS', 5),
       waitTimeSeconds: num('SQS_WAIT_TIME_SECONDS', 10),
-      visibilityTimeoutSeconds: num('SQS_VISIBILITY_TIMEOUT_SECONDS', 60),
+      visibilityTimeoutSeconds: num('SQS_VISIBILITY_TIMEOUT_SECONDS', 90),
       batchSize: num('SQS_BATCH_SIZE', 10),
       shutdownGraceMs: num('SHUTDOWN_GRACE_MS', 10_000),
     },

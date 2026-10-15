@@ -21,8 +21,9 @@ export interface UnitOfWorkOptions {
    */
   lockTimeoutMs?: number;
   /**
-   * Teto de cada instrução (SET LOCAL statement_timeout). Maior que lock_timeout: espera de lock
-   * termina em 55P03 (refeita); só uma instrução lenta de verdade termina em 57014, tratada como
+   * Teto de cada instrução (SET LOCAL statement_timeout): proteção contra instrução travada. Maior que
+   * 2 × lock_timeout (uma aquisição de lock de linha pode esperar duas vezes), então espera de lock
+   * termina em 55P03 (refeita); só uma instrução travada de verdade termina em 57014, tratada como
    * indisponibilidade (503 / retry SQS) e não refeita aqui, para não multiplicar o pior caso.
    */
   statementTimeoutMs?: number;
@@ -46,7 +47,7 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
   ) {
     this.maxAttempts = options.maxAttempts ?? 5;
     this.lockTimeoutMs = Math.max(1, Math.floor(options.lockTimeoutMs ?? 5_000));
-    this.statementTimeoutMs = Math.max(this.lockTimeoutMs + 1, Math.floor(options.statementTimeoutMs ?? 8_000));
+    this.statementTimeoutMs = Math.max(2 * this.lockTimeoutMs + 1, Math.floor(options.statementTimeoutMs ?? 15_000));
   }
 
   async run<T>(work: (scope: TransactionScope) => Promise<T>): Promise<T> {

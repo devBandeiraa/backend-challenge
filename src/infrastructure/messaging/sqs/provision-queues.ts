@@ -18,7 +18,7 @@ export async function provisionQueues(
   client: SQSClient,
   names: SqsQueueNames = DEFAULT_QUEUE_NAMES,
   maxReceiveCount = Number(process.env.SQS_MAX_RECEIVE_COUNT ?? 5),
-  visibilityTimeoutSeconds = Number(process.env.SQS_VISIBILITY_TIMEOUT_SECONDS ?? 60),
+  visibilityTimeoutSeconds = Number(process.env.SQS_VISIBILITY_TIMEOUT_SECONDS ?? 90),
 ): Promise<ProvisionedQueues> {
   const fifo = { FifoQueue: 'true', ContentBasedDeduplication: 'false' };
   const create = async (QueueName: string) => (await client.send(new CreateQueueCommand({ QueueName, Attributes: fifo }))).QueueUrl!;

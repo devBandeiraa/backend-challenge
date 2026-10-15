@@ -39,7 +39,7 @@ export class OutboxPublisher {
   async publishOnce(): Promise<{ published: number; failed: number }> {
     return this.orm.em.fork().transactional(
       async (em) => {
-        await em.execute(`SET LOCAL statement_timeout = ${Math.floor(this.options.statementTimeoutMs ?? 8_000)}`);
+        await em.execute(`SET LOCAL statement_timeout = ${Math.floor(this.options.statementTimeoutMs ?? 15_000)}`);
         const now = new Date();
         const rows = await em.find(
           OutboxRecord,

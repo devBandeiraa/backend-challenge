@@ -130,13 +130,13 @@ Lida na subida da instância; os defaults servem para rodar no host.
 | `MIGRATION_DATABASE_URL` | `postgresql://wagering:wagering@localhost:5442/wagering` | **owner** do schema, usado só pelas migrations; o `migrate` também provisiona o login da app a partir de `DATABASE_URL` |
 | `DB_POOL_MAX` | 10 | conexões por instância |
 | `DB_LOCK_TIMEOUT_MS` | 5000 | teto de espera por lock em cada transação |
-| `DB_STATEMENT_TIMEOUT_MS` | 8000 | teto de cada instrução SQL; precisa ser maior que `DB_LOCK_TIMEOUT_MS` (**a instância não sobe** se não for) |
+| `DB_STATEMENT_TIMEOUT_MS` | 15000 | teto de cada instrução SQL (proteção contra instrução travada); precisa ser maior que 2 × `DB_LOCK_TIMEOUT_MS` (**a instância não sobe** se não for) |
 | `UOW_MAX_ATTEMPTS` | 5 | tentativas da transação em conflito de concorrência |
 | `APP_ROLES` | `http,consumer,outbox,pending-reference` | papéis desta instância |
 | `SQS_ENDPOINT` | `http://localhost:4566` | emulador SQS |
 | `SQS_INPUT_QUEUE` / `SQS_DLQ` / `SQS_EVENTS_QUEUE` | `wager-transactions.fifo` / `…-dlq.fifo` / `wager-events.fifo` | filas |
 | `SQS_CONSUMER_MAX_ATTEMPTS` | 5 | recebimentos até FAILED + DLQ |
-| `SQS_VISIBILITY_TIMEOUT_SECONDS` | 60 | precisa ser ≥ 1,5 × pior caso de processamento; **a instância não sobe** se for menor |
+| `SQS_VISIBILITY_TIMEOUT_SECONDS` | 90 | precisa ser ≥ 1,5 × pior caso de processamento; **a instância não sobe** se for menor |
 | `SQS_WAIT_TIME_SECONDS` / `SQS_BATCH_SIZE` | 10 / 10 | long polling e tamanho do lote |
 | `SHUTDOWN_GRACE_MS` | 10000 (20000 no compose) | prazo para concluir mensagens em andamento no SIGTERM |
 | `OUTBOX_BATCH_SIZE` / `OUTBOX_INTERVAL_MS` | 100 / 200 | publisher da outbox |
