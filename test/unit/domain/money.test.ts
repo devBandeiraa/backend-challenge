@@ -67,6 +67,12 @@ describe('Money: aritmética exata', () => {
     expect(() => brl('99999999999999999.99').add(brl('0.01'))).toThrow(InvalidMoneyError);
   });
 
+  test('canAdd antecipa o overflow sem lançar (a política rejeita antes)', () => {
+    expect(brl('99999999999999999.98').canAdd(brl('0.01'))).toBe(true);
+    expect(brl('99999999999999999.99').canAdd(brl('0.01'))).toBe(false);
+    expect(() => brl('1.00').canAdd(usd('1.00'))).toThrow(CurrencyMismatchError);
+  });
+
   test('subtract pode produzir negativo (aritmética interna) e negate inverte', () => {
     const diff = brl('10.00').subtract(brl('25.50'));
     expect(diff.amount).toBe('-15.50');

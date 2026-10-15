@@ -9,6 +9,7 @@
 export const FailureCode = {
   InsufficientFunds: 'INSUFFICIENT_FUNDS',
   ReversalWouldOverdraw: 'REVERSAL_WOULD_OVERDRAW',
+  BalanceLimitExceeded: 'BALANCE_LIMIT_EXCEEDED',
   ReferenceNotFound: 'REFERENCE_NOT_FOUND',
   ReferenceMismatch: 'REFERENCE_MISMATCH',
   ReferenceAlreadyReversed: 'REFERENCE_ALREADY_REVERSED',
@@ -32,6 +33,10 @@ export const FAILURE_CODE_CATALOG: Record<FailureCode, { action: FailureAction; 
   REVERSAL_WOULD_OVERDRAW: {
     action: 'give_up',
     description: 'ROLLBACK que debitaria (de WIN/REFUND) deixaria saldo negativo; exige tratamento operacional.',
+  },
+  BALANCE_LIMIT_EXCEEDED: {
+    action: 'give_up',
+    description: 'Crédito que levaria o saldo além da faixa persistível (NUMERIC(19,2)); exige tratamento operacional.',
   },
   REFERENCE_NOT_FOUND: { action: 'fix_payload', description: 'Referência não chegou dentro da janela de retry.' },
   REFERENCE_MISMATCH: {

@@ -99,6 +99,7 @@ Todos os testes usam **Postgres e LocalStack reais**. "e2e" = `bun run test:mult
 | Regras BET/WIN/LOSS/REFUND/ROLLBACK (7) | [settlement-policy.ts](src/domain/wagering/settlement-policy.ts) | [settlement-policy.test.ts](test/unit/domain/settlement-policy.test.ts), [use-cases.test.ts](test/integration/use-cases.test.ts) |
 | Reversão única; valor igual; mesmo contexto (7.2–7.5) | política + `wt_single_reversal_uq` + FK composta de referência | [settlement-policy.test.ts](test/unit/domain/settlement-policy.test.ts), [hot-wallet.test.ts](test/concurrency/hot-wallet.test.ts) ("REFUND e ROLLBACK da MESMA BET em paralelo") |
 | Reversão que estoura saldo, código distinto (7.9) | `REVERSAL_WOULD_OVERDRAW` | [settlement-policy.test.ts](test/unit/domain/settlement-policy.test.ts), [use-cases.test.ts](test/integration/use-cases.test.ts) |
+| Crédito além da faixa do saldo é rejeição de negócio, não erro interno | `BALANCE_LIMIT_EXCEEDED` (política) + migration 006 | [settlement-policy.test.ts](test/unit/domain/settlement-policy.test.ts) ("limite superior"), [http-api.test.ts](test/integration/http-api.test.ts) (422), [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts) (ack, sem DLQ) |
 | Replay devolve o resultado original com o saldo do momento (7.7) | snapshot `result_balance` na linha da transação | [use-cases.test.ts](test/integration/use-cases.test.ts), [http-api.test.ts](test/integration/http-api.test.ts) (mesmo status e corpo: 200/422/202) |
 | Referência fora de ordem, worker, backoff, limite → REJECTED + evento (7.1) | [resolve-pending-references.ts](src/application/wagering/resolve-pending-references.ts) | [pending-reference-worker.test.ts](test/integration/pending-reference-worker.test.ts), [restart-consistency.test.ts](test/recovery/restart-consistency.test.ts) |
 | failureCodes estáveis (7.2) | [failure-code.ts](src/domain/wagering/failure-code.ts) | seção [4.4](#44-taxonomia-de-failurecode) |
@@ -235,7 +236,7 @@ O limite de tentativas vale para PENDING_REFERENCE (seção [7.4](#74-worker-de-
 3. kind da referência;
 4. status da referência;
 5. valor e reversão anterior;
-6. saldo.
+6. saldo: insuficiente num débito, ou acima da faixa de NUMERIC(19,2) num crédito (`BALANCE_LIMIT_EXCEEDED`).
 
 O que invalida a operação para sempre é verificado antes do que depende de estado. A política é uma
 função pura que **decide** e não executa: aplicar, sem efeito, rejeitar ou aguardar.
@@ -280,6 +281,7 @@ PENDING só existe dentro da transação SQL. Os estados terminais são congelad
 |---|---|---|
 | `INSUFFICIENT_FUNDS` | retry_later (nova transação) | BET maior que o saldo |
 | `REVERSAL_WOULD_OVERDRAW` | give_up (operacional) | ROLLBACK que debitaria (de WIN/REFUND) deixaria saldo negativo |
+| `BALANCE_LIMIT_EXCEEDED` | give_up (operacional) | crédito (WIN, REFUND, ROLLBACK de BET) que levaria o saldo além de NUMERIC(19,2) |
 | `REFERENCE_NOT_FOUND` | fix_payload | referência não chegou dentro da janela |
 | `REFERENCE_MISMATCH` | fix_payload | referência de outro player/wallet/moeda/rodada |
 | `REFERENCE_ALREADY_REVERSED` | give_up | já existe reversão efetiva (decisão B) |

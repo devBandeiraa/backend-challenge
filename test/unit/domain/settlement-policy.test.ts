@@ -197,3 +197,22 @@ describe('validações da wallet (antes de qualquer referência)', () => {
     expect(decide(w, newTx(w, K.Bet, { money: usd('1.00') }))).toMatchObject({ type: 'reject', code: F.CurrencyMismatch });
   });
 });
+
+describe('limite superior do saldo (NUMERIC(19,2))', () => {
+  test('WIN que levaria o saldo além da faixa: BALANCE_LIMIT_EXCEEDED (rejeição, não erro interno)', () => {
+    const w = openWallet('99999999999999999.99');
+    expect(decide(w, newTx(w, K.Win, { amount: '0.01' }))).toMatchObject({ type: 'reject', code: F.BalanceLimitExceeded });
+  });
+
+  test('ROLLBACK de BET (crédito) também respeita o limite', () => {
+    const w = openWallet('99999999999999999.99');
+    const bet = processedBet(w, '10.00');
+    const rollback = newTx(w, K.Rollback, { amount: '10.00', referenceExternalTransactionId: bet.externalTransactionId });
+    expect(decide(w, rollback, bet)).toMatchObject({ type: 'reject', code: F.BalanceLimitExceeded, referenceTransactionId: bet.id });
+  });
+
+  test('crédito que cabe exatamente no limite é aplicado', () => {
+    const w = openWallet('99999999999999999.98');
+    expect(decide(w, newTx(w, K.Win, { amount: '0.01' }))).toMatchObject({ type: 'apply', direction: LedgerDirection.Credit });
+  });
+});

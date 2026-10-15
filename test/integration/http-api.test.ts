@@ -117,6 +117,18 @@ describe('POST /wagering/transactions', () => {
     expect((await submit(body)).status).toBe(422);
   });
 
+  test('422 BALANCE_LIMIT_EXCEEDED quando o crédito estouraria NUMERIC(19,2) (não 500); replay idem', async () => {
+    const w = await createWallet('999.99');
+    const body = txBody(w, { kind: 'WIN', money: { amount: '99999999999999999.99', currency: 'BRL' } });
+    const res = await submit(body);
+    expect(res.status).toBe(422);
+    expect(res.body).toMatchObject({ status: 'REJECTED', failureCode: 'BALANCE_LIMIT_EXCEEDED', balance: { amount: '999.99' } });
+    const replay = await submit(body);
+    expect(replay.status).toBe(422);
+    expect(replay.body).toEqual({ ...res.body, idempotentReplay: true });
+    expect((await call('GET', `/wallets/${w.id}`)).body.balance.amount).toBe('999.99');
+  });
+
   test('202 PENDING_REFERENCE quando a referência ainda não chegou', async () => {
     const w = await createWallet();
     const res = await submit(txBody(w, { kind: 'REFUND', referenceExternalTransactionId: 'not-yet' }));

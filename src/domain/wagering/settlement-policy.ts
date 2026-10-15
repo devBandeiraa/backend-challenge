@@ -69,6 +69,11 @@ export class SettlementPolicy {
       // Códigos distintos: aposta sem saldo é rotina; reversão que estouraria o saldo é anomalia operacional.
       return reject(tx.isReversal() ? FailureCode.ReversalWouldOverdraw : FailureCode.InsufficientFunds, referenceTransactionId);
     }
+    if (direction === LedgerDirection.Credit && !wallet.canCredit(tx.money)) {
+      // Simétrico ao saldo insuficiente: o saldo resultante não caberia em NUMERIC(19,2).
+      // É regra de negócio (REJECTED auditável), não erro interno.
+      return reject(FailureCode.BalanceLimitExceeded, referenceTransactionId);
+    }
     return { type: 'apply', direction, referenceTransactionId };
   }
 }

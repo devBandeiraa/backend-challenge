@@ -115,6 +115,12 @@ export class Wallet {
     return !this._balance.isLessThan(money);
   }
 
+  /** O saldo após o crédito continua dentro da faixa persistível (NUMERIC(19,2))? */
+  canCredit(money: Money): boolean {
+    this.assertSameCurrency(money);
+    return this._balance.canAdd(money);
+  }
+
   debit(props: MovementProps): WalletLedgerEntry {
     return this.apply(LedgerDirection.Debit, props);
   }

@@ -138,6 +138,21 @@ describe('processamento', () => {
     expect(await drain(client, gateway.urls.deadLetter, 500)).toHaveLength(0);
     expect(await drain(client, gateway.urls.input, 300)).toHaveLength(0);
   });
+
+  test('crédito que estouraria NUMERIC(19,2): REJECTED BALANCE_LIMIT_EXCEEDED, ack na 1ª entrega, sem FAILED nem DLQ', async () => {
+    const w = await wallet('1000.00');
+    const cmd = wagerCommand(w, { kind: 'WIN', money: { amount: '99999999999999999.99', currency: 'BRL' } });
+    const retriesBefore = (await app.metrics.sqsRetries.get()).values[0]?.value ?? 0;
+    await send(wagerMessage(messageData(cmd)).body, w.id);
+    consumer().start();
+    await waitFor(async () => (await statusOf(cmd.idempotencyKey))?.failure_code === 'BALANCE_LIMIT_EXCEEDED');
+    await Bun.sleep(1_500);
+    expect(await statusOf(cmd.idempotencyKey)).toMatchObject({ status: 'REJECTED' });
+    expect(await walletBalance(app.orm, w.id)).toBe('1000.00');
+    expect(await drain(client, gateway.urls.deadLetter, 500)).toHaveLength(0);
+    expect(await drain(client, gateway.urls.input, 300)).toHaveLength(0);
+    expect((await app.metrics.sqsRetries.get()).values[0]?.value ?? 0).toBe(retriesBefore);
+  });
 });
 
 describe('erros permanentes → DLQ', () => {

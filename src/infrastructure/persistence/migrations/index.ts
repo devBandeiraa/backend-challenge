@@ -4,6 +4,7 @@ import { Migration002CreateWagerTransactions } from './002-create-wager-transact
 import { Migration003CreateWalletLedgerEntries } from './003-create-wallet-ledger-entries';
 import { Migration004IntegrityTriggers } from './004-integrity-triggers';
 import { Migration005CreateInboxOutbox } from './005-create-inbox-outbox';
+import { Migration006BalanceLimitFailureCode } from './006-balance-limit-failure-code';
 
 // Lista explícita em vez de glob: ordem determinística, funciona igual em dev/teste/imagem
 // e não depende de descoberta por filesystem (que varia entre Bun/Node/bundle).
@@ -13,4 +14,5 @@ export const migrationsList: MigrationObject[] = [
   { name: '003-create-wallet-ledger-entries', class: Migration003CreateWalletLedgerEntries },
   { name: '004-integrity-triggers', class: Migration004IntegrityTriggers },
   { name: '005-create-inbox-outbox', class: Migration005CreateInboxOutbox },
+  { name: '006-balance-limit-failure-code', class: Migration006BalanceLimitFailureCode },
 ];

@@ -80,6 +80,12 @@ export class Money {
     return this.value.lessThan(other.value);
   }
 
+  /** A soma cabe na faixa persistível (NUMERIC(19,2))? Permite à política rejeitar antes de `add` lançar. */
+  canAdd(other: Money): boolean {
+    this.assertSameCurrency(other);
+    return !this.value.plus(other.value).abs().greaterThan(MAX_ABS);
+  }
+
   equals(other: Money): boolean {
     return this.currency === other.currency && this.value.equals(other.value);
   }
