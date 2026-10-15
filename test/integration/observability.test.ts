@@ -4,6 +4,7 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
+import { DeleteQueueCommand } from '@aws-sdk/client-sqs';
 import { createLogger } from '../../src/infrastructure/observability/logger';
 import { WagerTransactionConsumer } from '../../src/interfaces/sqs/wager-transaction.consumer';
 import { createAppContext, messageData, openTestWallet, wagerCommand } from '../support/app-context';
@@ -113,6 +114,44 @@ describe('health e métricas', () => {
   test('/health/ready verifica Postgres e SQS', async () => {
     const res = await http(baseUrl, 'GET', '/health/ready');
     expect(res.body).toEqual({ status: 'ok', checks: { postgres: 'up', sqs: 'up' } });
+  });
+
+  test('/health/ready em 503 diz QUAL dependência caiu (SQS real indisponível: fila apagada)', async () => {
+    const { client, names, gateway } = await createTestQueues('ready');
+    const other = await startHttpApp({ SQS_INPUT_QUEUE: names.input, SQS_DLQ: names.deadLetter, SQS_EVENTS_QUEUE: names.events });
+    try {
+      expect((await http(other.baseUrl, 'GET', '/health/ready')).status).toBe(200);
+      await client.send(new DeleteQueueCommand({ QueueUrl: gateway.urls.input }));
+      const down = await http(other.baseUrl, 'GET', '/health/ready');
+      expect(down.status).toBe(503);
+      expect(down.headers.get('retry-after')).toBe('1');
+      expect(down.body).toEqual({ status: 'unavailable', checks: { postgres: 'up', sqs: 'down' } });
+      expect((await http(other.baseUrl, 'GET', '/health/live')).status).toBe(200); // liveness não depende do SQS
+    } finally {
+      await other.close();
+    }
+  });
+
+  test('latência medida em TODOS os desfechos HTTP (sucesso, payload inválido, conflito, negócio)', async () => {
+    const countOf = async (outcome: string) => {
+      const text = (await http<string>(baseUrl, 'GET', '/metrics')).body;
+      const line = text.split('\n').find((l) => l.startsWith(`wagering_processing_duration_seconds_count{source="http",outcome="${outcome}"}`));
+      return Number(line?.split(' ').at(-1) ?? 0);
+    };
+    const before = Object.fromEntries(await Promise.all(['PROCESSED', 'validation', 'conflict', 'business'].map(async (o) => [o, await countOf(o)])));
+    const w = (await http(baseUrl, 'POST', '/wallets', { body: { playerId: crypto.randomUUID(), initialBalance: { amount: '10.00', currency: 'BRL' } } })).body;
+    touch(w.id);
+    const ext = `lat-${crypto.randomUUID()}`;
+    const body = { providerId: 'provider-lat', externalTransactionId: ext, playerId: w.playerId, walletId: w.id, roundId: 'r', gameId: 'g', kind: 'BET', money: { amount: '1.00', currency: 'BRL' } };
+    const headers = { 'idempotency-key': `provider-lat:${ext}` };
+    expect((await http(baseUrl, 'POST', '/wagering/transactions', { body, headers })).status).toBe(200);
+    expect((await http(baseUrl, 'POST', '/wagering/transactions', { body: { ...body, money: { amount: '1.5', currency: 'BRL' } }, headers })).status).toBe(400);
+    expect((await http(baseUrl, 'POST', '/wagering/transactions', { body: { ...body, money: { amount: '2.00', currency: 'BRL' } }, headers })).status).toBe(409);
+    const ghost = { ...body, externalTransactionId: `lat-${crypto.randomUUID()}`, walletId: crypto.randomUUID() };
+    expect((await http(baseUrl, 'POST', '/wagering/transactions', { body: ghost, headers: { 'idempotency-key': `provider-lat:${ghost.externalTransactionId}` } })).status).toBe(422);
+    for (const outcome of ['PROCESSED', 'validation', 'conflict', 'business']) {
+      expect(await countOf(outcome)).toBe(before[outcome] + 1);
+    }
   });
 
   test('/metrics expõe as métricas exigidas', async () => {

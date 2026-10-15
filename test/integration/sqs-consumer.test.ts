@@ -60,6 +60,12 @@ async function send(body: string, groupId: string) {
   await gateway.sendToInput(body, groupId, crypto.randomUUID());
 }
 
+async function duplicatesByLayer() {
+  const values = (await app.metrics.duplicates.get()).values;
+  const of = (layer: string) => values.find((v) => v.labels.layer === layer)?.value ?? 0;
+  return { inbox: of('inbox'), idempotency: of('idempotency') };
+}
+
 async function statusOf(idempotencyKey: string) {
   const [row] = await app.orm.em
     .fork()
@@ -96,6 +102,7 @@ describe('processamento', () => {
     const w = await wallet('100.00');
     const cmd = wagerCommand(w, { money: { amount: '10.00', currency: 'BRL' } });
     const msg = wagerMessage(messageData(cmd));
+    const dupBefore = await duplicatesByLayer();
     await send(msg.body, w.id);
     await send(msg.body, w.id); // produtor reenviou (outro dedup id no SQS, mesmo messageId lógico)
     const c = consumer();
@@ -104,7 +111,10 @@ describe('processamento', () => {
     await Bun.sleep(1_500);
     expect(await walletBalance(app.orm, w.id)).toBe('90.00');
     expect(await countRows(app.orm, `wallet_ledger_entries l JOIN wager_transactions t ON t.id = l.transaction_id WHERE t.idempotency_key = ?`, [cmd.idempotencyKey])).toBe(1);
-    expect((await app.metrics.duplicates.get()).values.find((v) => v.labels.layer === 'inbox')?.value).toBeGreaterThanOrEqual(1);
+    // uma redelivery = UMA duplicata (inbox), não duas (inbox + replay da key)
+    const dupAfter = await duplicatesByLayer();
+    expect(dupAfter.inbox - dupBefore.inbox).toBe(1);
+    expect(dupAfter.idempotency - dupBefore.idempotency).toBe(0);
   });
 
   test('mesma operação com OUTRO messageId: inbox não pega, idempotency key pega (replay)', async () => {

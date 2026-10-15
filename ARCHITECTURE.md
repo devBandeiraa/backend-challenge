@@ -562,6 +562,10 @@ No compose: `init: true` (tini como PID 1, porque o Nest re-emite o sinal após 
   - o próprio Nest loga pelo mesmo pino (`PinoNestLogger`, `bufferLogs`);
   - cada requisição gera uma linha (método, rota, status, duração; `warn` para 4xx, `error` para 5xx;
     sem probes de health e scrape).
+  - **workers com backoff no erro** ([polling-worker.ts](src/infrastructure/workers/polling-worker.ts)): com o banco fora,
+    o intervalo dobra a cada falha seguida (teto de 30 s) e o erro é logado na 1ª falha e depois no máximo uma vez
+    a cada 30 s, com o número de falhas suprimidas; a volta é logada uma vez. Antes eram cerca de 27 linhas/s com 3
+    réplicas. Prova: [polling-worker.test.ts](test/unit/infrastructure/polling-worker.test.ts).
 - **Sem payload financeiro:**
   - os call sites logam ids e status;
   - `redact` mascara `money`/`balance`/`amount`/`body`/`payload`/`data` se alguém logar um objeto inteiro;
@@ -571,7 +575,7 @@ No compose: `init: true` (tini como PID 1, porque o Nest re-emite o sinal após 
 | Métrica | O que mede |
 |---|---|
 | `wagering_transactions_total{status,source,replay}` | transações por status e origem |
-| `wagering_duplicates_detected_total{layer}` | duplicatas: `idempotency` / `inbox` |
+| `wagering_duplicates_detected_total{layer}` | duplicatas: `idempotency` / `inbox`; cada duplicata conta **uma** vez, na camada que a pegou (uma redelivery SQS é `inbox`, não também `idempotency`) |
 | `wagering_db_lock_conflicts_total{sqlstate}` | **cada** retry por conflito de lock |
 | `wagering_db_retries_exhausted_total` | unidades de trabalho que desistiram (503 / retry SQS) |
 | `wagering_sqs_messages_total{outcome}`, `wagering_sqs_retries_total` | desfecho de cada mensagem; retries |
@@ -579,12 +583,13 @@ No compose: `init: true` (tini como PID 1, porque o Nest re-emite o sinal após 
 | `wagering_outbox_lag_seconds`, `..._pending_messages`, `..._published_total`, `..._publish_failures_total` | outbox |
 | `wagering_pending_reference_resolutions_total{result}` | tentativas do worker |
 | `wagering_reconciliation_mismatches_total` | divergências encontradas |
-| `wagering_processing_duration_seconds{source}` | latência (histograma) |
+| `wagering_processing_duration_seconds{source,outcome}` | latência (histograma) de **todo** desfecho: status do resultado ou categoria do erro no HTTP (`validation`, `conflict`, `business`, `transient`, `internal`); disposição da mensagem no SQS (`processed`, `duplicate`, `retry`, `dead_lettered`...) |
 
 - **Health:**
   - `/health/live` só verifica o processo; nunca consulta dependências, senão uma queda do banco
     reiniciaria todas as réplicas.
-  - `/health/ready` verifica Postgres e SQS em paralelo, com timeout curto.
+  - `/health/ready` verifica Postgres e SQS em paralelo, com timeout curto. Em falha responde **503** com
+    `Retry-After` e o detalhe por dependência: `{"status":"unavailable","checks":{"postgres":"up","sqs":"down"}}`.
   - Os dois são `@Public`.
 
 ---

@@ -1,5 +1,6 @@
 import { Body, Controller, Get, Headers, Inject, Param, Post, Req, Res } from '@nestjs/common';
 import type { Request, Response } from 'express';
+import { ApplicationError } from '../../application/errors';
 import { WalletQueries } from '../../application/queries';
 import { ProcessWagerTransactionUseCase, type WagerTransactionOutcome } from '../../application/wagering/process-wager-transaction';
 import { WagerTransactionStatus } from '../../domain/wagering/wager-transaction-kind';
@@ -37,18 +38,26 @@ export class TransactionsController {
     @Res({ passthrough: true }) res: Response,
   ) {
     const startedAt = performance.now();
-    const key = parse(idempotencyKeyHeader, idempotencyKey, 'Idempotency-Key header');
-    const input = parse(submitTransactionBody, body, 'body');
-    enrichContext({ walletId: input.walletId, providerId: input.providerId });
-    const correlationId = correlationIdOf(req);
-    const outcome = await this.processTransaction.execute({
-      ...input,
-      idempotencyKey: key,
-      correlationId,
-      causationId: correlationId,
-    });
+    let outcome: WagerTransactionOutcome;
+    try {
+      const key = parse(idempotencyKeyHeader, idempotencyKey, 'Idempotency-Key header');
+      const input = parse(submitTransactionBody, body, 'body');
+      enrichContext({ walletId: input.walletId, providerId: input.providerId });
+      const correlationId = correlationIdOf(req);
+      outcome = await this.processTransaction.execute({
+        ...input,
+        idempotencyKey: key,
+        correlationId,
+        causationId: correlationId,
+      });
+    } catch (error) {
+      // Latência também dos erros (400/409/422/503/500): são eles que formam a cauda.
+      this.metrics.observeLatency('http', error instanceof ApplicationError ? error.category : 'internal', startedAt);
+      throw error;
+    }
     enrichContext({ transactionId: outcome.transactionId });
-    this.metrics.recordOutcome('http', outcome, startedAt);
+    this.metrics.recordOutcome('http', outcome);
+    this.metrics.observeLatency('http', outcome.status, startedAt);
     res.status(STATUS_BY_OUTCOME[outcome.status]);
     return present(outcome);
   }

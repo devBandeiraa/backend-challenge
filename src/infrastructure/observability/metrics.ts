@@ -94,10 +94,16 @@ export class AppMetrics {
     registers: [this.registry],
   });
 
+  /**
+   * Latência de TODA submissão, qualquer que seja o desfecho: outcome = status do resultado
+   * (PROCESSED, REJECTED, PENDING_REFERENCE, FAILED) ou a categoria do erro no HTTP (validation,
+   * conflict, business, not_found, transient, internal); no SQS, a disposição da mensagem.
+   * Medir só sucessos esconderia justamente as caudas (503 após retries, timeouts).
+   */
   readonly processingDuration = new Histogram({
     name: 'wagering_processing_duration_seconds',
-    help: 'End-to-end processing latency of a wager submission',
-    labelNames: ['source'] as const,
+    help: 'End-to-end processing latency of a wager submission, by outcome',
+    labelNames: ['source', 'outcome'] as const,
     buckets: [0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
     registers: [this.registry],
   });
@@ -106,10 +112,22 @@ export class AppMetrics {
     if (options.defaultMetrics) collectDefaultMetrics({ register: this.registry });
   }
 
-  recordOutcome(source: 'http' | 'sqs' | 'worker', outcome: { status: string; idempotentReplay: boolean }, startedAt: number): void {
+  /**
+   * Conta o desfecho. Uma duplicata é contada UMA vez, na camada que a detectou primeiro: uma
+   * redelivery SQS pega pela inbox também faz replay da transação, mas é uma duplicata só (inbox).
+   */
+  recordOutcome(
+    source: 'http' | 'sqs' | 'worker',
+    outcome: { status: string; idempotentReplay: boolean; inboxDuplicate?: boolean },
+  ): void {
     this.transactions.inc({ source, status: outcome.status, replay: String(outcome.idempotentReplay) });
-    if (outcome.idempotentReplay) this.duplicates.inc({ layer: 'idempotency' });
-    this.processingDuration.observe({ source }, (performance.now() - startedAt) / 1000);
+    const layer = outcome.inboxDuplicate ? 'inbox' : outcome.idempotentReplay ? 'idempotency' : undefined;
+    if (layer) this.duplicates.inc({ layer });
+  }
+
+  /** Latência fim a fim de uma submissão, em qualquer desfecho (inclusive erro). */
+  observeLatency(source: 'http' | 'sqs', outcome: string, startedAt: number): void {
+    this.processingDuration.observe({ source, outcome }, (performance.now() - startedAt) / 1000);
   }
 }
 

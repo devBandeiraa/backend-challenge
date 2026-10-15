@@ -148,6 +148,13 @@ export class WagerTransactionConsumer {
 
   async handle(message: ReceivedMessage): Promise<Disposition> {
     const startedAt = performance.now();
+    const disposition = await this.dispatch(message);
+    // Latência de TODA entrega, qualquer que seja o desfecho (processada, retry, DLQ...).
+    this.metrics.observeLatency('sqs', disposition, startedAt);
+    return disposition;
+  }
+
+  private async dispatch(message: ReceivedMessage): Promise<Disposition> {
     let parsed: { command: SubmitWagerTransactionCommand; inbound: InboundMessage };
     try {
       parsed = this.parse(message);
@@ -160,7 +167,7 @@ export class WagerTransactionConsumer {
     // of work, DLQ) carrega messageId/correlationId/walletId/providerId automaticamente.
     return runWithContext(
       { messageId: inbound.messageId, correlationId: command.correlationId, walletId: command.walletId, providerId: command.providerId },
-      () => this.process(message, command, inbound, startedAt),
+      () => this.process(message, command, inbound),
     );
   }
 
@@ -168,7 +175,6 @@ export class WagerTransactionConsumer {
     message: ReceivedMessage,
     command: SubmitWagerTransactionCommand,
     inbound: InboundMessage,
-    startedAt: number,
   ): Promise<Disposition> {
     const log = this.logger.child({ receiveCount: message.receiveCount });
     let outcome: MessageOutcome;
@@ -192,8 +198,7 @@ export class WagerTransactionConsumer {
     } catch (error) {
       log.warn({ msg: 'ack failed after commit; message will be redelivered and deduplicated by inbox', err: error });
     }
-    this.metrics.recordOutcome('sqs', outcome, startedAt);
-    if (outcome.inboxDuplicate) this.metrics.duplicates.inc({ layer: 'inbox' });
+    this.metrics.recordOutcome('sqs', outcome); // redelivery pega pela inbox conta como UMA duplicata (inbox)
     const disposition: Disposition = outcome.inboxDuplicate ? 'duplicate' : 'processed';
     this.metrics.sqsMessages.inc({ outcome: disposition });
     log.info({ msg: 'message handled', disposition, status: outcome.status, failureCode: outcome.failureCode });
