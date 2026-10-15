@@ -47,9 +47,9 @@ export function loadConfig(): AppConfig {
   const lockTimeoutMs = num('DB_LOCK_TIMEOUT_MS', 5_000);
   const statementTimeoutMs = num('DB_STATEMENT_TIMEOUT_MS', 15_000);
   // statement_timeout é proteção contra instrução TRAVADA, não mecanismo de contenção: espera de lock
-  // precisa terminar por lock_timeout (55P03, refeito pela unit of work). Sob contenção, UM
-  // SELECT ... FOR NO KEY UPDATE pode esperar duas vezes (fila do lock da tupla + transação que detém a
-  // linha), cada uma limitada por lock_timeout; por isso o teto da instrução precisa passar de 2×.
+  // precisa terminar por lock_timeout (55P03, refeito pela unit of work). Uma instrução pode esperar
+  // mais de um lock (ex.: unicidade e FK), por isso o teto passa de 2×. O lock da wallet (fila de hot
+  // wallet) é isento e regido só por lock_timeout: ver lockById.
   if (statementTimeoutMs <= 2 * lockTimeoutMs) {
     throw new Error(
       `DB_STATEMENT_TIMEOUT_MS (${statementTimeoutMs}) must be greater than 2 × DB_LOCK_TIMEOUT_MS (${lockTimeoutMs})`,

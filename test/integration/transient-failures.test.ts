@@ -100,3 +100,21 @@ test('statement_timeout: instrução travada é cancelada (57014) e vira falha t
   expect(retries).toBe(0); // 57014 não é refeito: não multiplica o pior caso
   expect(elapsed).toBeLessThan(1_500);
 });
+
+test('lock da wallet é isento do statement_timeout (fila de hot wallet), mas o teto volta logo depois dele', async () => {
+  const wallet = (await http(baseUrl, 'POST', '/wallets', {
+    body: { playerId: crypto.randomUUID(), initialBalance: { amount: '10.00', currency: 'BRL' } },
+  })).body as { id: string };
+  const uow = new MikroOrmUnitOfWork(orm, { maxAttempts: 1, lockTimeoutMs: 100, statementTimeoutMs: 300 });
+  const seen: string[] = [];
+  const error = await uow
+    .run(async (scope) => {
+      await scope.wallets.lockById(wallet.id);
+      seen.push((await emOf(scope).execute('SHOW statement_timeout'))[0]!.statement_timeout!);
+      await emOf(scope).execute('SELECT pg_sleep(2)'); // depois do lock: o teto vale de novo
+    })
+    .catch((e: unknown) => e);
+  expect(seen).toEqual(['300ms']);
+  expect(sqlStateOf((error as TransientInfrastructureError).cause)).toBe('57014');
+  await assertLedgerInvariant(orm, wallet.id);
+});

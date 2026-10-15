@@ -493,11 +493,16 @@ ainda o usar. Tabela nova numa migration futura precisa de `GRANT` explícito.
   `visibilityTimeout < 1,5 × pior caso`.
   - **`statement_timeout` por transação** (`SET LOCAL`, padrão 15 s): proteção contra instrução **travada** (query
     lenta, rede meio-aberta), não mecanismo de contenção. Precisa ser maior que **2 × `lock_timeout`** (a instância
-    não sobe se não for): sob contenção, um único `SELECT ... FOR NO KEY UPDATE` pode esperar duas vezes (fila do
-    lock da tupla e depois a transação que detém a linha), cada uma limitada por `lock_timeout`. Com um teto menor
-    (a 1ª versão usava 8 s), o hot-wallet de 200 apostas recebia `57014` em esperas legítimas de fila. Assim, espera
-    de lock termina em `55P03` e é refeita; só uma instrução travada termina em `57014`, tratada como
-    indisponibilidade (503 / retry SQS) e **não** refeita na mesma entrega. Vale também para o publisher da outbox.
+    não sobe se não for), porque uma instrução pode esperar mais de um lock. Uma instrução travada termina em `57014`,
+    tratada como indisponibilidade (503 / retry SQS) e **não** refeita na mesma entrega. Vale também para o publisher
+    da outbox.
+  - **Exceção: o lock da wallet** ([repositories.ts](src/infrastructure/persistence/repositories.ts), `lockById`). Sob
+    contenção contínua, um único `SELECT ... FOR NO KEY UPDATE` espera várias vezes em sequência: cada commit à frente
+    reabre a espera pela nova versão da linha. Cada espera respeita `lock_timeout`, mas a soma cresce com a fila, e
+    nenhum teto fixo convive com ela: a 1ª versão (8 s) e depois 15 s cortaram em `57014` esperas legítimas do
+    hot-wallet de 200 apostas, inclusive na validação a partir de clone limpo. Por isso essa instrução roda com
+    `statement_timeout = 0` e é regida só por `lock_timeout` a cada espera (`55P03`, refeita), como antes; o teto
+    volta logo depois dela. O que segura uma mensagem é limitado pelo **teto do heartbeat**, não pela fila.
   - Pior caso = o maior de dois caminhos, mais o backoff entre tentativas:
     - lock: (tentativas + 1 da gravação do FAILED) × `lock_timeout`;
     - instrução travada: (tentativas − 1) × `lock_timeout` + 2 × `statement_timeout` (a que estoura e a do FAILED).

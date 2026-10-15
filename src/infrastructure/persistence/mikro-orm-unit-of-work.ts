@@ -22,9 +22,10 @@ export interface UnitOfWorkOptions {
   lockTimeoutMs?: number;
   /**
    * Teto de cada instrução (SET LOCAL statement_timeout): proteção contra instrução travada. Maior que
-   * 2 × lock_timeout (uma aquisição de lock de linha pode esperar duas vezes), então espera de lock
-   * termina em 55P03 (refeita); só uma instrução travada de verdade termina em 57014, tratada como
+   * 2 × lock_timeout (uma instrução pode esperar mais de um lock, ex.: unicidade e FK), então espera de
+   * lock termina em 55P03 (refeita); só uma instrução travada termina em 57014, tratada como
    * indisponibilidade (503 / retry SQS) e não refeita aqui, para não multiplicar o pior caso.
+   * Exceção: o lock da wallet (lockById), cuja fila sob contenção é regida só por lock_timeout.
    */
   statementTimeoutMs?: number;
 }
@@ -59,6 +60,8 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
           async (tem) => {
             await tem.execute(`SET LOCAL lock_timeout = ${this.lockTimeoutMs}`);
             await tem.execute(`SET LOCAL statement_timeout = ${this.statementTimeoutMs}`);
+            // Guardado para o lock da wallet restaurar o teto depois da sua espera isenta (ver lockById).
+            await tem.execute(`SET LOCAL wagering.statement_timeout = '${this.statementTimeoutMs}'`);
             return work(createTransactionScope(tem));
           },
           { isolationLevel: IsolationLevel.READ_COMMITTED },

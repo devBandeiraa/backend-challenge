@@ -55,8 +55,17 @@ class MikroOrmWalletRepository implements WalletRepository {
   }
 
   async lockById(id: string): Promise<Wallet | undefined> {
+    // A fila do lock de uma hot wallet NÃO é cortada pelo statement_timeout: sob contenção contínua,
+    // esta instrução espera várias vezes em sequência (cada commit à frente reabre a espera pela nova
+    // versão da linha). Cada espera continua limitada por lock_timeout (55P03, refeita pela unit of
+    // work); cortar a fila inteira em 57014 transformaria espera legítima em 503. Todas as outras
+    // instruções seguem com o teto, que volta logo depois (só em sucesso: em erro a transação aborta).
+    await this.em.execute(`SELECT set_config('statement_timeout', '0', true)`);
     // FOR NO KEY UPDATE e não LockMode.PESSIMISTIC_WRITE (FOR UPDATE): ver decisão A.
     const rows = await this.em.execute(`SELECT * FROM wallets WHERE id = ? FOR NO KEY UPDATE`, [id]);
+    await this.em.execute(
+      `SELECT set_config('statement_timeout', coalesce(current_setting('wagering.statement_timeout', true), '0'), true)`,
+    );
     const row = rows[0];
     return row ? toWallet(this.em.map(WalletRecord, row)) : undefined;
   }
