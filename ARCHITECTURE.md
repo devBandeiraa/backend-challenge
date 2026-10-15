@@ -59,7 +59,9 @@ a duplicata assume o processamento. Quando nenhuma linha é inserida:
 
 ### D — `WALLET_NOT_FOUND` não é persistido
 `wager_transactions.wallet_id` tem FK para `wallets`: preferi integridade referencial a persistir
-transações órfãs. O HTTP responde 422 `WALLET_NOT_FOUND`. No SQS é erro de negócio: grava a inbox (sem `transaction_id`) e faz ack.
+transações órfãs. O HTTP responde 422 `WALLET_NOT_FOUND`. No SQS é erro de negócio, com **ack e sem inbox**:
+a exceção desfaz a transação inteira, mas não há efeito financeiro a proteger. Uma redelivery só
+recalcula o mesmo resultado (e, se a wallet tiver sido criada nesse meio-tempo, processa corretamente).
 
 ### Quando `FAILED` é gravado
 O HTTP **nunca** grava FAILED: falha transitória responde 503 e o cliente reenvia com a mesma key.
@@ -68,7 +70,16 @@ FAILED (`PROCESSING_FAILED`) é gravado numa **transação separada, curta e bes
 - pelo consumer SQS, quando esgota os retries transitórios (`ApproximateReceiveCount ≥ MAX`)
   ou encontra um erro inesperado não classificado. Depois de gravar, envia a mensagem
   explicitamente para a DLQ e a remove da fila de origem;
-- pelo worker de PENDING_REFERENCE, em erro permanente não relacionado à referência.
+- pelo worker de PENDING_REFERENCE, quando a resolução de uma linha lança erro **não transitório**
+  (bug, dado inesperado). Sem isso, uma linha "venenosa" seria reivindicada em loop para sempre.
+  Erros transitórios só deixam a linha pendente para o próximo ciclo.
+
+Detalhes:
+- A gravação do FAILED **não trava a wallet**: o INSERT pega só o `FOR KEY SHARE` da FK.
+  Por isso ela funciona mesmo quando a causa dos retries é justamente a wallet disputada (há teste disso).
+- Se a transação já existir (por exemplo, PENDING_REFERENCE ou terminal), ela não é sobrescrita.
+- FAILED não emite evento de integração, porque não está na lista do enunciado. O sinal operacional é a DLQ
+  e a métrica `wagering_dlq_messages_total{reason}`.
 
 Se nem a gravação do FAILED for possível (banco fora), a mensagem vai para a DLQ sem o registro,
 e o redrive a reprocessa depois. FAILED é terminal para aquela key: o replay devolve 422
@@ -241,6 +252,131 @@ resultado. "retry_later" significa enviar uma nova transação. O catálogo est�
 - **`application/`:** casos de uso como classes puras. O Nest só as monta por factory (`app.module.ts`).
 - **`infrastructure/`:** os registros de persistência (`defineEntity`) são separados dos agregados.
   A reidratação passa sempre por `rehydrate`.
+
+## Decisões da Fase 2 (mensageria, workers, concorrência)
+
+### Consumer SQS
+- **Mesmo use case do HTTP:** `executeFromMessage` envolve o mesmo `process()` e adiciona a inbox
+  **na mesma transação SQL** de transação, wallet, ledger e outbox.
+- **Duas camadas de deduplicação:**
+  - **inbox**, por `(consumer_name, message_id)`, de transporte: o SQS reentregou a mesma mensagem;
+  - **idempotency key**, de negócio: o provedor reenviou a mesma operação com outro messageId.
+  - Numa redelivery, o fluxo segue o caminho normal, e o insert-first devolve o resultado original
+    sem efeito. O ack sempre corresponde a um resultado real.
+- **Envelope tolerante, `data` estrito:**
+  - No envelope, só `data` é obrigatório. `messageId`, `type` e `occurredAt` são opcionais, e campos
+    extras passam (uma mudança de envelope do produtor não pode mandar dinheiro para a DLQ).
+  - Sem `messageId`, usa o `MessageId` do SQS, que é estável entre redeliveries.
+  - O `data` é zod `strict`, com `idempotencyKey` obrigatória, e o conteúdo do Money é validado pelo domínio.
+  - O hash da inbox é o SHA-256 do `data` canônico. O mesmo messageId com conteúdo diferente resulta
+    em `INBOX_PAYLOAD_MISMATCH`, que vai para a DLQ.
+- **Ack só depois do commit.** Um crash entre o commit e o ack causa redelivery, que a inbox reconhece:
+  nenhum efeito novo. Isso é provado com **processo real** encerrado com `exit 137` no hook pós-commit
+  ([crash-after-commit.test.ts](test/concurrency/crash-after-commit.test.ts)).
+- **Classificação de erros:**
+
+| Erro | Ação | FAILED? |
+|---|---|---|
+| REJECTED (negócio), `WALLET_NOT_FOUND` | ack | — |
+| JSON/envelope/`data` inválido, `INVALID_MONEY`, conflito de idempotência, `INBOX_PAYLOAD_MISMATCH` | DLQ (motivo em atributo) | não: não há transação válida e única |
+| transitório, com `receiveCount < SQS_CONSUMER_MAX_ATTEMPTS` (5) | `ChangeMessageVisibility` com backoff exponencial (1 s → 60 s) | — |
+| transitório no limite, ou erro inesperado | grava FAILED (transação separada) e depois DLQ | sim |
+
+- **Limite do consumer vs. redrive:** o consumer desiste no 5º recebimento, e o redrive do SQS
+  (`maxReceiveCount=5`) só moveria no 6º. O redrive é a rede de segurança para crash loop, em que
+  o consumer morre antes de decidir.
+- **Mensagem na DLQ:** é enviada com o corpo original, o mesmo `MessageGroupId`, `MessageDeduplicationId`
+  igual ao id SQS original e os atributos `failureReason`, `receiveCount` e `originalMessageId`.
+  Só depois a mensagem é apagada da origem.
+- **Concorrência:** sequencial **dentro** de um `MessageGroupId` (walletId), paralela **entre** grupos.
+  - **Trade-off:** uma mensagem em retry segura a fila daquela wallet (comportamento FIFO) até ser
+    processada ou ir para a DLQ. A ordem por wallet é preservada ao custo de latência só para aquela wallet.
+- **Visibility timeout de 30 s vs. pior caso:** são 5 tentativas da unit of work × `lock_timeout` de 5 s,
+  mais backoff, o que dá cerca de 26 s, abaixo de 30 s. Se esses parâmetros mudarem, o visibility timeout
+  precisa acompanhar.
+
+### SIGTERM / shutdown
+1. O Nest (`enableShutdownHooks`) chama `beforeApplicationShutdown` **antes** de o ORM fechar o pool.
+2. O consumer para de receber (aborta o long polling) e conclui o que está em andamento
+   (`SHUTDOWN_GRACE_MS`, 20 s no compose).
+3. Mensagens já recebidas que não começaram voltam **imediatamente** para a fila (`ChangeMessageVisibility 0`).
+4. O que exceder o prazo volta sozinho quando o visibility timeout expirar.
+5. Workers de polling param cooperativamente: o tick corrente termina, nunca no meio de uma transação.
+
+No compose:
+- `init: true` (tini como PID 1): o Nest re-emite o sinal depois do shutdown, e o PID 1 ignoraria sinais
+  sem handler.
+- `stop_grace_period: 30s`, maior que o prazo de 20 s do consumer.
+
+**Evidência:**
+- [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts): a mensagem em andamento conclui e a
+  não iniciada é reprocessada por outro consumer em segundos, não em 30 s.
+- [multi-instance.e2e.ts](test/e2e/multi-instance.e2e.ts): `docker kill --signal SIGTERM` numa réplica
+  durante o consumo de 120 mensagens. Resultado: logs de shutdown cooperativo, saída 143, nenhuma mensagem
+  perdida ou duplicada e a réplica volta healthy depois de `docker start`.
+  O Docker **não** aplica restart policy após `docker kill`; em produção, quem recria é o orquestrador.
+
+### Outbox publisher
+- **Reivindicação:** `em.find(..., { lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE })`, que gera
+  `FOR UPDATE SKIP LOCKED`, em lotes. Cada publisher pega um lote diferente.
+- **Publicação:** `SendMessageBatch` com `MessageGroupId = aggregateId` e `MessageDeduplicationId = eventId`.
+  `published_at` é marcado na mesma transação (trade-off já registrado).
+- **Falha no SQS:** o lote é reagendado com o backoff da outbox (`OutboxMessage.scheduleRetry`, até
+  5 min e nunca descartado). Há teste que apaga a fila de destino de verdade.
+- **Ordenação:** dentro de um lote, segue `next_attempt_at, occurred_at`. **Entre publishers concorrentes,
+  a ordem por agregado não é garantida.** Os consumidores devem usar `walletVersion` (em
+  `WalletBalanceChanged`) para ordenar e o `eventId` para deduplicar. Garantir ordem global exigiria um
+  publisher único por agregado (particionamento), o que não compensa aqui.
+- **Métricas:** `wagering_outbox_lag_seconds` (idade do pendente mais antigo, pelo relógio do banco) e
+  `wagering_outbox_pending_messages`, atualizadas no máximo uma vez por segundo por instância.
+
+### Worker de PENDING_REFERENCE
+- **Um item por transação:** `claimDuePendingReference` (`FOR UPDATE SKIP LOCKED`), depois o lock da wallet
+  e o **mesmo** `TransactionSettler` da submissão.
+- **Tentativas:** `attempts` conta as tentativas de resolução, incluindo o processamento inicial. Na tentativa
+  `PENDING_REFERENCE_MAX_ATTEMPTS` (10), a transação vira `REJECTED`/`REFERENCE_NOT_FOUND` com
+  `WagerTransactionRejected`.
+- **Evento:** `WagerTransactionPendingReference` é emitido **uma vez**, na entrada; reagendamentos não repetem.
+- **Cadeias fora de ordem** (`ROLLBACK(REFUND)` → `REFUND` → `BET`) se resolvem em ordem causal, porque
+  uma referência ainda pendente mantém o dependente aguardando. Há teste disso.
+
+### Métricas (por instância, `GET /metrics`)
+| Métrica | O que mede |
+|---|---|
+| `wagering_transactions_total{status,source,replay}` | transações por status e origem (http/sqs) |
+| `wagering_duplicates_detected_total{layer}` | duplicatas: `idempotency` ou `inbox` |
+| `wagering_db_lock_conflicts_total{sqlstate}` | **cada** retry por conflito (deadlock, lock timeout, serialization) |
+| `wagering_db_retries_exhausted_total` | unit of work que desistiu (vira 503 ou retry SQS) |
+| `wagering_sqs_messages_total{outcome}`, `wagering_sqs_retries_total` | desfecho de cada mensagem; retries com backoff |
+| `wagering_dlq_messages_total{reason}` | mensagens movidas para a DLQ |
+| `wagering_outbox_published_total`, `..._publish_failures_total`, `..._lag_seconds`, `..._pending_messages` | outbox |
+| `wagering_pending_reference_resolutions_total{result}` | resultado das tentativas do worker |
+| `wagering_processing_duration_seconds{source}` | latência (histograma) |
+
+### Estratégia de testes
+- **Infraestrutura real em tudo:** Postgres e LocalStack em todos os testes de integração e concorrência.
+  O único "spy" é um wrapper que **delega** ao gateway SQS real, para contar envios por eventId. A única
+  injeção de falha de programação (linha venenosa do worker) também roda sobre o banco real.
+- **Filas exclusivas por teste** (`createTestQueues`): nenhuma mensagem vaza entre testes.
+- **Concorrência:**
+  - barreira (`inParallel`): todas as operações são criadas e só disparam quando todas estão prontas;
+  - 3 contextos de aplicação com **pools próprios**, como 3 instâncias;
+  - cenários repetidos (100/80/80 em 20 rodadas, reversões concorrentes em 10) para exercitar várias intercalações.
+- **`assertLedgerInvariant()`** ao final de cada teste de concorrência e de cada wallet tocada: saldo
+  armazenado igual à soma do ledger, e `version` igual à versão do último lançamento, calculados no banco
+  com NUMERIC exato.
+- **3 instâncias de verdade:** `bun run test:multi` sobe o compose (3 réplicas com pool, consumer,
+  publisher e worker próprios, atrás do nginx), verifica pelo header `X-Instance-Id` que ≥ 3 réplicas
+  atenderam, roda os cenários pelo nginx e desliga as réplicas no fim.
+- **Guard:** `bun run test` recusa rodar com réplicas no ar, porque publishers e workers delas
+  concorreriam com as medições.
+- **Timeout:** passado por `--timeout` nos scripts. Um `setDefaultTimeout` no preload só valeria para o
+  primeiro arquivo da execução.
+- **Instabilidade observada (honesta):** na primeira execução do multi-instância, logo após um rebuild
+  do stack, uma requisição da rajada de 50 recebeu "socket closed" no cliente sem registro no nginx.
+  Não reproduziu em 4 execuções seguintes. A causa provável, **não confirmada**, é o reuso de uma conexão
+  keep-alive do cliente durante a recriação dos containers.
+  O comportamento correto de um provedor nesse caso é reenviar com a mesma Idempotency-Key, o que é seguro.
 
 ## Stack e ambiente
 

@@ -47,8 +47,16 @@ one-shot `sqs-init` (código da própria aplicação, idempotente), então nada 
 
 ## Testes
 
+Todos os testes de integração usam **Postgres e LocalStack reais**, sem mocks de banco ou de fila.
+
 ```bash
-bun test                  # tudo (precisa de infra:up)
-bun run test:unit         # domínio, sem infraestrutura
-bun run test:integration  # Postgres e SQS reais
+bun run infra:up          # Postgres + SQS + migrations + filas
+bun run test              # unidade + integração + concorrência (host, ~1 min)
+bun run test:unit         # só domínio/aplicação, sem infraestrutura
+bun run test:integration  # integração (schema, use cases, HTTP, consumer, outbox, worker)
+bun run test:concurrency  # corridas reais com barreira, 3 pools, crash após commit
+bun run test:multi        # sobe 3 réplicas + nginx, roda o e2e multi-instância e desliga as réplicas
 ```
+
+- Use `bun run test`, não `bun test` puro: o script passa `--timeout 60000`, necessário para long polling e backoff.
+- `bun run test` recusa rodar com as réplicas do compose no ar (`docker compose stop app nginx`).
