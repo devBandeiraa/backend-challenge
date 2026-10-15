@@ -14,6 +14,9 @@ export const DEFAULT_QUEUE_NAMES: SqsQueueNames = {
 
 export function createSqsClient(endpoint = process.env.SQS_ENDPOINT ?? 'http://localhost:4566'): SQSClient {
   return new SQSClient({
+    // LocalStack devolve QueueUrl com host localhost.localstack.cloud (inalcançável de dentro do
+    // container). Usar sempre o endpoint configurado torna a URL só um identificador da fila.
+    useQueueUrlAsEndpoint: false,
     endpoint,
     region: process.env.AWS_REGION ?? 'us-east-1',
     // Emuladores aceitam qualquer credencial; em AWS real vem da cadeia padrão (IAM role).

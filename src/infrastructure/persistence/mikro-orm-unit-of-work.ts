@@ -7,7 +7,19 @@ import { classifyPgError, constraintOf, sqlStateOf } from './pg-errors';
 import { createTransactionScope } from './repositories';
 
 export interface UnitOfWorkObserver {
+  /** Chamado a CADA retry por conflito de concorrência (vira a métrica de lock conflicts). */
   onRetry?(info: { attempt: number; sqlState: string | undefined; constraint: string | undefined }): void;
+  onExhausted?(info: { attempts: number; sqlState: string | undefined }): void;
+}
+
+export interface UnitOfWorkOptions {
+  maxAttempts?: number;
+  /**
+   * Teto de espera por lock dentro de cada transação (SET LOCAL lock_timeout). Sem ele, uma
+   * hot wallet sob carga extrema empilha conexões esperando indefinidamente; com ele, a espera
+   * vira 55P03 → retry com backoff → 503/retry SQS: degradação explícita e mensurável.
+   */
+  lockTimeoutMs?: number;
 }
 
 /**
@@ -17,21 +29,30 @@ export interface UnitOfWorkObserver {
  */
 export class MikroOrmUnitOfWork implements UnitOfWork {
   private readonly backoff = new ExponentialBackoff({ baseMs: 10, factor: 2, maxMs: 200, jitterRatio: 0.5 });
+  private readonly maxAttempts: number;
+  private readonly lockTimeoutMs: number;
 
   constructor(
     private readonly orm: MikroORM,
-    private readonly maxAttempts = 5,
+    options: UnitOfWorkOptions = {},
     private readonly observer: UnitOfWorkObserver = {},
-  ) {}
+  ) {
+    this.maxAttempts = options.maxAttempts ?? 5;
+    this.lockTimeoutMs = Math.max(1, Math.floor(options.lockTimeoutMs ?? 5_000));
+  }
 
   async run<T>(work: (scope: TransactionScope) => Promise<T>): Promise<T> {
     for (let attempt = 1; ; attempt++) {
       // fork por tentativa: nenhum estado (identity map, entidades) vaza de uma tentativa abortada.
       const em = this.orm.em.fork({ clear: true });
       try {
-        return await em.transactional((tem) => work(createTransactionScope(tem)), {
-          isolationLevel: IsolationLevel.READ_COMMITTED,
-        });
+        return await em.transactional(
+          async (tem) => {
+            await tem.execute(`SET LOCAL lock_timeout = ${this.lockTimeoutMs}`);
+            return work(createTransactionScope(tem));
+          },
+          { isolationLevel: IsolationLevel.READ_COMMITTED },
+        );
       } catch (error) {
         if (error instanceof ApplicationError) throw error;
         const kind = classifyPgError(error);
@@ -41,6 +62,7 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
           continue;
         }
         if (kind === 'retryable') {
+          this.observer.onExhausted?.({ attempts: attempt, sqlState: sqlStateOf(error) });
           throw new TransientInfrastructureError(`gave up after ${attempt} attempts (${sqlStateOf(error)})`, error);
         }
         if (kind === 'unavailable') throw new TransientInfrastructureError('database unavailable', error);

@@ -6,6 +6,8 @@ import { CLOCK, type Clock, ID_GENERATOR, type IdGenerator, UNIT_OF_WORK, type U
 import { WalletQueries } from './application/queries';
 import { ProcessWagerTransactionUseCase } from './application/wagering/process-wager-transaction';
 import { OpenWalletUseCase } from './application/wallets/open-wallet';
+import { APP_CONFIG, type AppConfig, loadConfig } from './infrastructure/config';
+import { AppMetrics, METRICS } from './infrastructure/observability/metrics';
 import { buildOrmConfig } from './infrastructure/persistence/mikro-orm.config';
 import { MikroOrmUnitOfWork } from './infrastructure/persistence/mikro-orm-unit-of-work';
 import { SystemClock, UuidV7Generator } from './infrastructure/system';
@@ -13,6 +15,7 @@ import { ProviderAuthGuard } from './interfaces/http/auth.guard';
 import { correlationMiddleware } from './interfaces/http/correlation';
 import { HttpErrorFilter } from './interfaces/http/error-filter';
 import { HealthController } from './interfaces/http/health.controller';
+import { MetricsController } from './interfaces/http/metrics.controller';
 import { TransactionsController } from './interfaces/http/transactions.controller';
 import { WalletsController } from './interfaces/http/wallets.controller';
 
@@ -33,12 +36,33 @@ const useCases = [
 ];
 
 @Module({
-  imports: [MikroOrmModule.forRoot(buildOrmConfig())],
-  controllers: [HealthController, WalletsController, TransactionsController],
+  imports: [
+    MikroOrmModule.forRootAsync({
+      useFactory: () => {
+        const { db } = loadConfig();
+        return buildOrmConfig({ clientUrl: db.url, poolMax: db.poolMax });
+      },
+    }),
+  ],
+  controllers: [HealthController, MetricsController, WalletsController, TransactionsController],
   providers: [
+    { provide: APP_CONFIG, useFactory: loadConfig },
+    { provide: METRICS, useFactory: () => new AppMetrics({ defaultMetrics: true }) },
     { provide: CLOCK, useClass: SystemClock },
     { provide: ID_GENERATOR, useClass: UuidV7Generator },
-    { provide: UNIT_OF_WORK, useFactory: (orm: MikroORM) => new MikroOrmUnitOfWork(orm), inject: [MikroORM] },
+    {
+      provide: UNIT_OF_WORK,
+      useFactory: (orm: MikroORM, config: AppConfig, metrics: AppMetrics) =>
+        new MikroOrmUnitOfWork(
+          orm,
+          { maxAttempts: config.db.uowMaxAttempts, lockTimeoutMs: config.db.lockTimeoutMs },
+          {
+            onRetry: ({ sqlState }) => metrics.lockConflicts.inc({ sqlstate: sqlState ?? 'unknown' }),
+            onExhausted: () => metrics.retriesExhausted.inc(),
+          },
+        ),
+      inject: [MikroORM, APP_CONFIG, METRICS],
+    },
     ...useCases,
     { provide: APP_GUARD, useClass: ProviderAuthGuard },
   ],

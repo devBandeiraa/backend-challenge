@@ -1,8 +1,9 @@
-import { Body, Controller, Get, Headers, Param, Post, Req, Res } from '@nestjs/common';
+import { Body, Controller, Get, Headers, Inject, Param, Post, Req, Res } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { WalletQueries } from '../../application/queries';
 import { ProcessWagerTransactionUseCase, type WagerTransactionOutcome } from '../../application/wagering/process-wager-transaction';
 import { WagerTransactionStatus } from '../../domain/wagering/wager-transaction-kind';
+import { type AppMetrics, METRICS } from '../../infrastructure/observability/metrics';
 import { correlationIdOf } from './correlation';
 import { idempotencyKeyHeader, parse, submitTransactionBody, text, uuidParam } from './validation';
 
@@ -24,6 +25,7 @@ export class TransactionsController {
   constructor(
     private readonly processTransaction: ProcessWagerTransactionUseCase,
     private readonly queries: WalletQueries,
+    @Inject(METRICS) private readonly metrics: AppMetrics,
   ) {}
 
   @Post('wagering/transactions')
@@ -33,6 +35,7 @@ export class TransactionsController {
     @Req() req: Request,
     @Res({ passthrough: true }) res: Response,
   ) {
+    const startedAt = performance.now();
     const key = parse(idempotencyKeyHeader, idempotencyKey, 'Idempotency-Key header');
     const input = parse(submitTransactionBody, body, 'body');
     const correlationId = correlationIdOf(req);
@@ -42,6 +45,7 @@ export class TransactionsController {
       correlationId,
       causationId: correlationId,
     });
+    this.metrics.recordOutcome('http', outcome, startedAt);
     res.status(STATUS_BY_OUTCOME[outcome.status]);
     return present(outcome);
   }
