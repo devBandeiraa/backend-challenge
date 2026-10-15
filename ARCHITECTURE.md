@@ -8,7 +8,7 @@ Este documento registra **o que** foi decidido, **por quê**, o que foi trocado 
 1. [Visão geral](#1-visão-geral)
 2. [Rastreabilidade: requisito → prova](#2-rastreabilidade-requisito--prova)
 3. [Decisões centrais](#3-decisões-centrais) (destaque: [B](#b--uma-única-reversão-efetiva-por-referência-mais-restrito-que-o-enunciado))
-4. [Domínio e regras de negócio](#4-domínio-e-regras-de-negócio)
+4. [Domínio e regras de negócio](#4-domínio-e-regras-de-negócio) (desvios do enunciado: [4.5](#45-desvios-e-interpretações-do-enunciado))
 5. [Persistência, concorrência e integridade no schema](#5-persistência-concorrência-e-integridade-no-schema)
 6. [Idempotência](#6-idempotência)
 7. [Mensageria: consumer, outbox, worker, shutdown](#7-mensageria-consumer-outbox-worker-shutdown)
@@ -90,6 +90,8 @@ Todos os testes usam **Postgres e LocalStack reais**. "e2e" = `bun run test:mult
 | Requisito (seção do README) | Implementação | Prova |
 |---|---|---|
 | Money imutável, escala 2, rejeições de entrada (6.1) | [money.ts](src/domain/shared/money.ts) | [money.test.ts](test/unit/domain/money.test.ts), [http-api.test.ts](test/integration/http-api.test.ts) ("25", "25.5", "1e2" → 400) |
+| Moeda ISO-4217 com 2 casas na entrada; dado persistido legível (6.1) | [currency.ts](src/domain/shared/currency.ts), `Money.from` × `Money.rehydrate` | [money.test.ts](test/unit/domain/money.test.ts) ("fora da lista ISO-4217", "rehydrate"), [http-api.test.ts](test/integration/http-api.test.ts) (XYZ, JPY → 400) |
+| `providerId` `internal` reservado ao OPENING | contrato zod + `WagerTransaction.create` | [http-api.test.ts](test/integration/http-api.test.ts) (400), [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts) (DLQ), [wager-transaction.test.ts](test/unit/domain/wager-transaction.test.ts) |
 | Multi-moeda, conflito de moeda testado (6.1) | `assertSameCurrency`; `CURRENCY_MISMATCH` | [money.test.ts](test/unit/domain/money.test.ts), [wallet.test.ts](test/unit/domain/wallet.test.ts), [settlement-policy.test.ts](test/unit/domain/settlement-policy.test.ts), [use-cases.test.ts](test/integration/use-cases.test.ts) |
 | Construtor privado + `create`/`from`/`rehydrate` sem revalidar (6.0) | todas as entidades do domínio | [wager-transaction.test.ts](test/unit/domain/wager-transaction.test.ts) ("rehydrate não revalida") |
 | 1 wallet por player+moeda; `version` começa em 1 e só sobe com saldo (6.2) | `UNIQUE (player_id, currency)`; trigger `wallets_guard` | [schema-constraints.test.ts](test/integration/schema-constraints.test.ts), [wallet.test.ts](test/unit/domain/wallet.test.ts), [use-cases.test.ts](test/integration/use-cases.test.ts) (LOSS não muda version) |
@@ -100,24 +102,27 @@ Todos os testes usam **Postgres e LocalStack reais**. "e2e" = `bun run test:mult
 | Reversão única; valor igual; mesmo contexto (7.2–7.5) | política + `wt_single_reversal_uq` + FK composta de referência | [settlement-policy.test.ts](test/unit/domain/settlement-policy.test.ts), [hot-wallet.test.ts](test/concurrency/hot-wallet.test.ts) ("REFUND e ROLLBACK da MESMA BET em paralelo") |
 | Reversão que estoura saldo, código distinto (7.9) | `REVERSAL_WOULD_OVERDRAW` | [settlement-policy.test.ts](test/unit/domain/settlement-policy.test.ts), [use-cases.test.ts](test/integration/use-cases.test.ts) |
 | Crédito além da faixa do saldo é rejeição de negócio, não erro interno | `BALANCE_LIMIT_EXCEEDED` (política) + migration 006 | [settlement-policy.test.ts](test/unit/domain/settlement-policy.test.ts) ("limite superior"), [http-api.test.ts](test/integration/http-api.test.ts) (422), [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts) (ack, sem DLQ) |
-| Replay devolve o resultado original com o saldo do momento (7.7) | snapshot `result_balance` na linha da transação | [use-cases.test.ts](test/integration/use-cases.test.ts), [http-api.test.ts](test/integration/http-api.test.ts) (mesmo status e corpo: 200/422/202) |
+| Replay devolve o resultado original com o saldo do momento (7.7) | snapshot `result_balance` na linha da transação | [use-cases.test.ts](test/integration/use-cases.test.ts), [http-api.test.ts](test/integration/http-api.test.ts) (mesmo status e corpo: 200/422/202), [pending-reference-worker.test.ts](test/integration/pending-reference-worker.test.ts) (202 resolvido → replay com o desfecho atual) |
 | Referência fora de ordem, worker, backoff, limite → REJECTED + evento (7.1) | [resolve-pending-references.ts](src/application/wagering/resolve-pending-references.ts) | [pending-reference-worker.test.ts](test/integration/pending-reference-worker.test.ts), [restart-consistency.test.ts](test/recovery/restart-consistency.test.ts) |
 | failureCodes estáveis (7.2) | [failure-code.ts](src/domain/wagering/failure-code.ts) | seção [4.4](#44-taxonomia-de-failurecode) |
 | Concorrência por wallet; cenário 100/80/80 (8) | `FOR NO KEY UPDATE` (decisão A) | [hot-wallet.test.ts](test/concurrency/hot-wallet.test.ts), [distinct-wallets.test.ts](test/concurrency/distinct-wallets.test.ts) ("wallet A travada não bloqueia B"), [wallet-lock-mode.test.ts](test/integration/wallet-lock-mode.test.ts), e2e |
 | ≥ 3 instâncias (8, 13) | compose `replicas: 3` + nginx | e2e [multi-instance.e2e.ts](test/e2e/multi-instance.e2e.ts) |
-| Unicidade, imutabilidade e não-negatividade **no schema** (5.9) | migrations 001–008 | [schema-constraints.test.ts](test/integration/schema-constraints.test.ts) (20 testes só com SQL) |
+| Unicidade, imutabilidade e não-negatividade **no schema** (5.9) | migrations 001–009 | [schema-constraints.test.ts](test/integration/schema-constraints.test.ts) (20 testes só com SQL) |
+| Garantias valem contra a própria credencial da app (menor privilégio) | migration 008: app sem superuser/ownership, ledger só `SELECT`/`INSERT` | [db-privileges.test.ts](test/integration/db-privileges.test.ts) |
 | Migrations versionadas e reversíveis (4) | [migrations/](src/infrastructure/persistence/migrations) | [schema-constraints.test.ts](test/integration/schema-constraints.test.ts) ("são reversíveis") |
 | Endpoints e cursor estável e opaco (9) | controllers HTTP, [queries.ts](src/application/queries.ts) | [http-api.test.ts](test/integration/http-api.test.ts) (cursor estável com inserções entre páginas) |
 | Status HTTP distintos e consistentes (9) | `HttpErrorFilter` + status pelo resultado | [http-api.test.ts](test/integration/http-api.test.ts), [transient-failures.test.ts](test/integration/transient-failures.test.ts) (503 + Retry-After) |
 | Idempotency key, payloadHash canônico, 409 em conflito (9) | seção [6](#6-idempotência) | [payload-hash.test.ts](test/unit/application/payload-hash.test.ts), [use-cases.test.ts](test/integration/use-cases.test.ts), [same-operation.test.ts](test/concurrency/same-operation.test.ts) |
 | Reconciliação: loga, mede e sinaliza sem corrigir (9) | [reconcile-wallet.ts](src/application/wallets/reconcile-wallet.ts) | [reconciliation.test.ts](test/integration/reconciliation.test.ts) (divergência forçada com `session_replication_role = replica`) |
-| Health live/ready abertos; ready = Postgres + SQS (9, 12) | [health.controller.ts](src/interfaces/http/health.controller.ts) | [observability.test.ts](test/integration/observability.test.ts), [http-api.test.ts](test/integration/http-api.test.ts) |
+| Health live/ready abertos; ready = Postgres + SQS, 503 com o detalhe por dependência (9, 12) | [health.controller.ts](src/interfaces/http/health.controller.ts) | [observability.test.ts](test/integration/observability.test.ts) (fila apagada → `{"sqs":"down"}`), [http-api.test.ts](test/integration/http-api.test.ts) |
 | Consumer: mesmo use case, inbox, ack após commit, negócio/transitório/permanente, limite → DLQ, SIGTERM, redelivery (10) | [wager-transaction.consumer.ts](src/interfaces/sqs/wager-transaction.consumer.ts) | [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts), [crash-after-commit.test.ts](test/concurrency/crash-after-commit.test.ts), e2e (SIGTERM) |
+| Instrução travada não segura a mensagem nem o grupo FIFO (10) | `statement_timeout` por transação (> 2 × `lock_timeout`) + teto do heartbeat | [transient-failures.test.ts](test/integration/transient-failures.test.ts) ("statement_timeout"), [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts) ("teto do heartbeat"), [consumer-timing.test.ts](test/unit/infrastructure/consumer-timing.test.ts) |
 | Atomicidade inbox + transação + wallet + ledger + outbox (6.5, 11) | um único `uow.run` por submissão | [atomicity.test.ts](test/integration/atomicity.test.ts): falha injetada DEPOIS de todas as escritas (HTTP e SQS) → nada persiste |
 | Outbox: publishers concorrentes; cenário de 5 passos com processos reais (11) | [outbox-publisher.ts](src/infrastructure/workers/outbox-publisher.ts) | [outbox-crash.test.ts](test/recovery/outbox-crash.test.ts): processo morto com SIGKILL antes de publicar (segurando as linhas) e depois do SendMessage; OUTRO processo publica; cada evento chega uma vez · [outbox-publisher.test.ts](test/integration/outbox-publisher.test.ts) (2 publishers) · [restart-consistency.test.ts](test/recovery/restart-consistency.test.ts) |
 | Eventos: classe abstrata + subclasses; `data` com MoneyProps; BalanceChanged só se o saldo mudou (11) | [wagering-events.ts](src/domain/events/wagering-events.ts) | [messaging.test.ts](test/unit/domain/messaging.test.ts), [use-cases.test.ts](test/integration/use-cases.test.ts) (LOSS sem BalanceChanged) |
 | Logs JSON com ids, sem payload financeiro (12) | pino + AsyncLocalStorage | [observability.test.ts](test/integration/observability.test.ts) |
-| Métricas mínimas (12) | [metrics.ts](src/infrastructure/observability/metrics.ts) | [observability.test.ts](test/integration/observability.test.ts), [transient-failures.test.ts](test/integration/transient-failures.test.ts) |
+| Log de erro dos workers sem inundar durante indisponibilidade (12) | backoff no [polling-worker.ts](src/infrastructure/workers/polling-worker.ts) | [polling-worker.test.ts](test/unit/infrastructure/polling-worker.test.ts) |
+| Métricas mínimas; latência em todos os desfechos; duplicata contada uma vez (12) | [metrics.ts](src/infrastructure/observability/metrics.ts) | [observability.test.ts](test/integration/observability.test.ts) ("latência medida em TODOS os desfechos"), [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts) (redelivery = 1 duplicata), [transient-failures.test.ts](test/integration/transient-failures.test.ts) |
 | Concorrência 1–8 (13) | — | 1: [same-operation](test/concurrency/same-operation.test.ts) · 2: [hot-wallet](test/concurrency/hot-wallet.test.ts) · 3: [distinct-wallets](test/concurrency/distinct-wallets.test.ts) · 4: e2e · 5: [crash-after-commit](test/concurrency/crash-after-commit.test.ts) · 6: [outbox-publisher](test/integration/outbox-publisher.test.ts) · 7: [pending-reference-worker](test/integration/pending-reference-worker.test.ts) · 8: [restart-consistency](test/recovery/restart-consistency.test.ts) |
 | Invariante final `balance == ledger` em todos | `assertLedgerInvariant()` em `afterEach` | [invariants.ts](test/support/invariants.ts): wallets tocadas pelo teste corrente (integração, observabilidade, recuperação, e2e); nos testes de SQL puro, toda wallet criada/alterada desde o início do teste; nos de concorrência, ao fim de cada teste. Exceção deliberada: as wallets corrompidas de propósito na reconciliação |
 | Teste de carga (diferencial) | `bun run test:load` | [load-test-report.md](docs/load-test-report.md), [load-test-analysis.md](docs/load-test-analysis.md) |
@@ -259,7 +264,7 @@ função pura que **decide** e não executa: aplicar, sem efeito, rejeitar ou ag
 - **⚠️ Extensão: LOSS com referência.** O README não prevê referência em LOSS. Ela é aceita
   opcionalmente, com as mesmas checagens do WIN (contexto e kind BET), em vez de ser ignorada.
 - **⚠️ WIN rejeitado por referência ausente.** Um WIN **com** referência cuja BET nunca chega fica em
-  PENDING_REFERENCE durante a janela do worker (10 tentativas, cerca de 3 min). Depois vira
+  PENDING_REFERENCE durante a janela do worker (10 tentativas, cerca de 2 min). Depois vira
   `REJECTED`/`REFERENCE_NOT_FOUND`, **sem crédito**, e emite o evento.
   - A referência declarada é tratada como pré-condição. É o comportamento conservador:
     não credita prêmio de aposta que não existe.
@@ -269,6 +274,12 @@ função pura que **decide** e não executa: aplicar, sem efeito, rejeitar ou ag
 - **Referência em outro contexto.** Referência de outra wallet, player ou rodada é rejeitada com
   `REFERENCE_MISMATCH` **sem gravar** `reference_transaction_id`, porque a FK composta só aceita
   referência da mesma wallet.
+- **⚠️ Referência de outro provider.** A referência é resolvida por `(providerId, referenceExternalTransactionId)`,
+  como diz o enunciado (§7.2). Por isso uma transação que cite o `externalTransactionId` de **outro** provedor não
+  encontra referência alguma: fica `PENDING_REFERENCE` (202) durante a janela do worker e termina
+  `REJECTED`/`REFERENCE_NOT_FOUND`, e não `REFERENCE_MISMATCH`. É intencional: o id externo só tem significado
+  dentro do provedor que o emitiu, e um provedor não pode nem sondar a existência das transações de outro.
+  Prova: [http-api.test.ts](test/integration/http-api.test.ts) ("referência de OUTRO provider").
 - **Referência existente, mas PENDING_REFERENCE** (ex.: ROLLBACK de um REFUND que ainda espera a BET):
   a transação também aguarda. As cadeias se resolvem em ordem causal.
 - **Snapshot do resultado** (`result_balance`, `result_wallet_version`): gravado em toda transação
@@ -301,6 +312,31 @@ PENDING só existe dentro da transação SQL. Os estados terminais são congelad
 
 Toda rejeição é terminal **para aquela Idempotency-Key**: reenviar com a mesma key devolve o mesmo
 resultado. "retry_later" significa enviar uma *nova* transação.
+
+---
+
+### 4.5 Desvios e interpretações do enunciado
+O §7 exige documentar toda interpretação adicional. Esta é a lista completa; cada item tem a justificativa
+na seção indicada e uma prova.
+
+| # | Enunciado | O que o serviço faz | Por quê | Onde / prova |
+|---|---|---|---|---|
+| 1 | Referência não revertida duas vezes "pelo mesmo tipo de operação" | **uma** reversão PROCESSED por referência, de **qualquer** kind | REFUND + ROLLBACK da mesma BET creditaria duas vezes (eliminatório) | decisão [B](#b--uma-única-reversão-efetiva-por-referência-mais-restrito-que-o-enunciado); [hot-wallet.test.ts](test/concurrency/hot-wallet.test.ts) |
+| 2 | LOSS sem referência prevista | LOSS aceita referência opcional, com as checagens do WIN | não descartar em silêncio um campo enviado | §4.2; [settlement-policy.test.ts](test/unit/domain/settlement-policy.test.ts) |
+| 3 | WIN "pode referenciar" a BET | WIN/LOSS **com** referência ausente aguardam e viram `REFERENCE_NOT_FOUND` | não creditar prêmio de aposta inexistente | §4.2; [pending-reference-worker.test.ts](test/integration/pending-reference-worker.test.ts) |
+| 4 | — | LOSS aceita `0.00`; os demais kinds exigem > 0 | LOSS só registra o resultado | §4.2; [wager-transaction.test.ts](test/unit/domain/wager-transaction.test.ts) |
+| 5 | A key é a fonte da verdade | mesmo `(provider, externalId)` com outra key → 409 `EXTERNAL_TRANSACTION_ID_CONFLICT` | a mesma operação do provedor não pode ter dois efeitos | §6; [use-cases.test.ts](test/integration/use-cases.test.ts) |
+| 6 | Escopo da key não definido | unicidade e replay por `(providerId, key)` | keys de provedores diferentes podem coincidir | §6; [http-api.test.ts](test/integration/http-api.test.ts) |
+| 7 | — | `WALLET_NOT_FOUND` não é persistido (422; ack sem inbox no SQS) | integridade referencial (FK) | decisão D; [use-cases.test.ts](test/integration/use-cases.test.ts) |
+| 8 | Taxonomia livre | códigos extras: `PLAYER_MISMATCH`, `REFERENCE_NOT_PROCESSED`, `WALLET_NOT_FOUND`, `PROCESSING_FAILED`, `BALANCE_LIMIT_EXCEEDED` | situações distintas para o provedor | §4.4 |
+| 9 | Escala fixa de 2 casas | mais de 2 casas é **rejeitado**, nunca arredondado | arredondar dinheiro esconde erro do provedor | §4.1; [money.test.ts](test/unit/domain/money.test.ts) |
+| 10 | Moeda ISO-4217 | só moedas correntes com unidade menor de 2 casas | a escala fixa não representa JPY (0) nem KWD (3) | §4.1; [money.test.ts](test/unit/domain/money.test.ts) |
+| 11 | — | crédito que estouraria NUMERIC(19,2) → REJECTED `BALANCE_LIMIT_EXCEEDED` | é regra de negócio, não erro interno | §4.2; [http-api.test.ts](test/integration/http-api.test.ts) |
+| 12 | Referência do mesmo provider (§7.2) | referência de **outro** provider não é encontrada → `REFERENCE_NOT_FOUND` após a janela | id externo só vale dentro do provedor; não vaza existência | §4.2; [http-api.test.ts](test/integration/http-api.test.ts) |
+| 13 | Replay devolve o resultado original | resultado terminal: mesmo status e corpo; **202 resolvido** devolve o desfecho atual | o estado mudou e o provedor precisa saber | §8; [pending-reference-worker.test.ts](test/integration/pending-reference-worker.test.ts) |
+| 14 | FAILED é erro permanente de infraestrutura | gravado só pelo consumer (limite de recebimentos) e pelo worker (linha venenosa); HTTP responde 503; replay de FAILED → 422 `PROCESSING_FAILED`; sem evento | FAILED é terminal e não pode nascer de erro transitório | §7.1–7.2; [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts) |
+| 15 | — | `providerId` `internal` reservado (400 / DLQ) | namespace das transações internas (OPENING) | §8; [http-api.test.ts](test/integration/http-api.test.ts) |
+| 16 | Destino dos eventos não definido | `wager-events.fifo`, grupo = aggregateId, dedup = eventId | ordem por agregado e dedup no broker | decisão F |
 
 ---
 
@@ -476,7 +512,9 @@ ainda o usar. Tabela nova numa migration futura precisa de `GRANT` explícito.
 ### 7.4 Worker de PENDING_REFERENCE
 - **Claim:** reivindica **uma** linha vencida por transação (`FOR UPDATE SKIP LOCKED`), trava a wallet
   e aplica o **mesmo** `TransactionSettler` da submissão. N instâncias dividem o trabalho sem coordenação.
-- **Janela:** 10 tentativas, base 500 ms ×2, teto 30 s, jitter de 20%, cerca de 3 min no total.
+- **Janela:** 10 tentativas (a 1ª é o processamento inicial), base 500 ms ×2, teto 30 s, jitter de 20%: cerca de
+  **2 min**. Nominal 0,5 + 1 + 2 + 4 + 8 + 16 + 30 + 30 + 30 = 121,5 s; com o jitter, entre ~97 s e 121,5 s
+  (medido na auditoria: 109,5 s até `REJECTED`/`REFERENCE_NOT_FOUND`).
   Fora de ordem em provedores é questão de segundos; minutos cobrem atraso de fila sem prender a
   transação indefinidamente. Ao esgotar: `REJECTED`/`REFERENCE_NOT_FOUND` + `WagerTransactionRejected`.
 - **Evento:** `WagerTransactionPendingReference` só na **entrada**; reagendamentos não repetem.
@@ -527,8 +565,12 @@ No compose: `init: true` (tini como PID 1, porque o Nest re-emite o sinal após 
 | 422 | REJECTED/FAILED com `failureCode` (mesmo corpo no replay) | ver taxonomia |
 | 503 | falha transitória (`Retry-After`) | reenviar com a **mesma** key |
 
-- **Status do replay:** sai do **resultado**. O replay recebe o mesmo status **e** o mesmo corpo da
-  primeira resposta, exceto `idempotentReplay`; há teste para 200, 422 e 202 e para `WALLET_NOT_FOUND`.
+- **Status do replay:** sai do **resultado gravado**. Para um resultado terminal (200 PROCESSED, 422 REJECTED/FAILED,
+  422 `WALLET_NOT_FOUND`), o replay recebe o mesmo status **e** o mesmo corpo da primeira resposta, exceto
+  `idempotentReplay`. Um **202** é a exceção por natureza: enquanto a transação está `PENDING_REFERENCE`, o replay
+  devolve 202; depois que o worker a resolve, devolve o desfecho atual (200 ou 422), porque o estado mudou e o
+  provedor precisa saber disso. Provas: [http-api.test.ts](test/integration/http-api.test.ts) (200/422/202) e
+  [pending-reference-worker.test.ts](test/integration/pending-reference-worker.test.ts) (replay do REFUND resolvido → PROCESSED).
   Por isso nenhum corpo de resultado tem campo volátil: o correlationId vai no header `X-Correlation-Id`.
 - **Mapeamento único:** o `HttpErrorFilter` faz o mapeamento categoria → status para todos os endpoints.
 - **`providerId` reservado:** `internal` (sem diferenciar maiúsculas) é o namespace das transações criadas pelo próprio
@@ -746,7 +788,11 @@ Dependências fixadas em versões publicadas há pelo menos 2 semanas.
   (ex.: apagar outbox publicada há mais de 7 dias, inbox além da janela de redelivery possível) ou
   particionamento por data.
 - **Reconciliação:** é sob demanda. Uma varredura periódica (job) com alerta na métrica seria o passo
-  seguinte. A comparação lê o ledger inteiro da wallet; para wallets enormes, checkpoints de saldo por versão.
+  seguinte. A comparação lê o ledger inteiro da wallet; para wallets enormes, checkpoints de saldo por versão
+  (hoje a leitura também é limitada pelo `statement_timeout` de 15 s e responderia 503).
+- **Owner do schema é superuser no compose de dev:** é o usuário de bootstrap da imagem do Postgres. A app já não
+  usa essa identidade (§5.2); em produção o owner seria um papel sem superuser, com `CREATEROLE` só para a migration 008,
+  e as senhas viriam de um cofre, não dos defaults do compose.
 - **FAILED não emite evento**, porque não está na lista do enunciado.
 - **Reversão parcial** fora de escopo (`AMOUNT_MISMATCH`).
 - **Autenticação** não implementada (seção 11).

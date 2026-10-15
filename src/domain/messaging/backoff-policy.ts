@@ -35,7 +35,8 @@ export class ExponentialBackoff {
 export const OUTBOX_BACKOFF = new ExponentialBackoff({ baseMs: 1_000, factor: 2, maxMs: 300_000, jitterRatio: 0.2 });
 
 /**
- * PENDING_REFERENCE: 10 tentativas, base 500 ms, ×2, teto 30 s ⇒ ~3 min de janela.
+ * PENDING_REFERENCE: 10 tentativas (a 1ª é o processamento inicial), base 500 ms, ×2, teto 30 s ⇒ ~2 min
+ * de janela: 0,5+1+2+4+8+16+30+30+30 = 121,5 s nominais; com o jitter de até 20%, entre ~97 s e 121,5 s.
  * Fora de ordem em provedores é questão de segundos; minutos cobrem atraso de fila sem
  * prender a transação indefinidamente.
  */

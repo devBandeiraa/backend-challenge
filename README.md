@@ -94,7 +94,9 @@ curl -s -X POST localhost:8088/wagering/transactions -H 'content-type: applicati
 - **422:** rejeição de negócio, com `failureCode`.
 - **503:** falha transitória, com `Retry-After`; reenvie com a **mesma** key.
 
-O replay devolve o mesmo status e o mesmo corpo da primeira resposta. A tabela de `failureCode`
+O replay de um resultado terminal (200/422) devolve o mesmo status e o mesmo corpo da primeira resposta. Um 202
+continua 202 enquanto a referência não chega; depois que o worker resolve a transação, o replay devolve o desfecho
+atual (200 ou 422). A tabela de `failureCode`
 está no [ARCHITECTURE.md §4.4](ARCHITECTURE.md#44-taxonomia-de-failurecode).
 
 ### SQS

@@ -145,6 +145,22 @@ describe('POST /wagering/transactions', () => {
     expect((await call('GET', `/wallets/${w.id}`)).body.balance.amount).toBe('999.99');
   });
 
+  test('referência de OUTRO provider não é encontrada: resolução por (providerId, ref) → 202, nunca a BET alheia', async () => {
+    const w = await createWallet('100.00');
+    const bet = txBody(w, { providerId: 'provider-a', money: { amount: '30.00', currency: 'BRL' } });
+    expect((await submit(bet)).status).toBe(200);
+    const refund = txBody(w, {
+      providerId: 'provider-b',
+      kind: 'REFUND',
+      money: { amount: '30.00', currency: 'BRL' },
+      referenceExternalTransactionId: bet.externalTransactionId,
+    });
+    const res = await submit(refund);
+    expect(res.status).toBe(202);
+    expect(res.body).toMatchObject({ status: 'PENDING_REFERENCE', balance: null });
+    expect((await call('GET', `/wallets/${w.id}`)).body.balance.amount).toBe('70.00'); // nada creditado
+  });
+
   test('202 PENDING_REFERENCE quando a referência ainda não chegou', async () => {
     const w = await createWallet();
     const res = await submit(txBody(w, { kind: 'REFUND', referenceExternalTransactionId: 'not-yet' }));
