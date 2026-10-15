@@ -567,7 +567,20 @@ No compose também: `init: true` (tini como PID 1, porque o Nest re-emite o sina
   processa em menos de 5 s, contra 30 s de visibility no teste) e "stop() conclui a mensagem em andamento";
 - [consumer-timing.test.ts](test/unit/infrastructure/consumer-timing.test.ts): o cálculo do prazo de shutdown;
 - e2e "SIGTERM durante o long poll": SIGTERM numa réplica ociosa e 30 mensagens logo em seguida; todas processadas
-  em menos de 20 s (mensagem presa levaria 90 s), com a contagem do que a vítima devolveu;
+  em menos de 20 s (mensagem presa levaria 90 s), com a contagem do que a vítima devolveu. `bun run test:multi`
+  5 vezes seguidas (15/10/2026), todas com 7 pass:
+
+  | Execução | `bun test` | total (com build e subida) | 30 mensagens processadas em | devolvidas pela vítima |
+  |---|---|---|---|---|
+  | 1 | 23,4 s | 42 s | 383 ms | 3 |
+  | 2 | 23,3 s | 42 s | 358 ms | 3 |
+  | 3 | 25,3 s | 44 s | 598 ms | 1 |
+  | 4 | 23,5 s | 42 s | 828 ms | 2 |
+  | 5 | 23,3 s | 42 s | 580 ms | 3 |
+
+  Em todas a vítima recebeu mensagens no long poll que estava aberto no SIGTERM (o cenário foi de fato exercitado)
+  e outra réplica as processou em menos de 1 s. O tempo do `bun test` subiu de cerca de 11 s para cerca de 23 s
+  porque os dois testes de SIGTERM agora esperam a vítima sair e voltar healthy;
 - e2e: `docker kill --signal SIGTERM` numa réplica durante 120 mensagens. Resultado: shutdown cooperativo
   nos logs, saída 143, nada perdido ou duplicado, e a réplica volta healthy após `docker start`.
   O Docker não aplica restart policy após `docker kill`; em produção, quem recria é o orquestrador.
