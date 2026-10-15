@@ -36,10 +36,9 @@ describe('payloadHash', () => {
     expect(hashWagerPayload(reordered)).toBe(hashWagerPayload(payload));
   });
 
-  test('"25.5" e "25.50" normalizados por Money geram o mesmo hash', () => {
-    const a = { ...payload, money: Money.from({ amount: '25.5', currency: 'BRL' }).toJSON() };
-    const b = { ...payload, money: Money.from({ amount: '25.50', currency: 'BRL' }).toJSON() };
-    expect(hashWagerPayload(a)).toBe(hashWagerPayload(b));
+  test('o contrato não admite grafias alternativas do mesmo valor: "25.5" é rejeitado antes do hash', () => {
+    expect(() => Money.from({ amount: '25.5', currency: 'BRL' })).toThrow();
+    expect(() => Money.from({ amount: '25', currency: 'BRL' })).toThrow();
   });
 
   test('ignora campos de transporte que não fazem parte do subconjunto de negócio', () => {

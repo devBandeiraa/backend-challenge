@@ -70,7 +70,8 @@ describe('ProcessWagerTransaction', () => {
     const cmd = wagerCommand(w, { money: { amount: '30.00', currency: 'BRL' } });
     const first = await app.processTransaction.execute(cmd);
     await app.processTransaction.execute(wagerCommand(w, { money: { amount: '5.00', currency: 'BRL' } })); // saldo muda depois
-    const replay = await app.processTransaction.execute({ ...cmd, correlationId: 'other', money: { amount: '30.0', currency: 'BRL' } });
+    // correlationId é metadado de transporte, fora do hash: continua sendo replay
+    const replay = await app.processTransaction.execute({ ...cmd, correlationId: 'other' });
     expect(replay).toEqual({ ...first, idempotentReplay: true });
     expect(replay.balance?.amount).toBe('70.00');
     expect(await countRows(app.orm, `wallet_ledger_entries WHERE transaction_id = ?`, [first.transactionId])).toBe(1);

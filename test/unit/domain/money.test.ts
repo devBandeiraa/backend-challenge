@@ -6,17 +6,18 @@ import { brl, usd } from '../../support/builders';
 describe('Money: entrada', () => {
   test.each([
     ['25.00', '25.00'],
-    ['25.5', '25.50'],
-    ['25', '25.00'],
-    ['0', '0.00'],
+    ['0.00', '0.00'],
     ['0.01', '0.01'],
     ['99999999999999999.99', '99999999999999999.99'], // limite de NUMERIC(19,2)
-  ])('aceita %p e normaliza para escala 2 (%p)', (input, expected) => {
+  ])('aceita %p (escala fixa de 2 casas) → %p', (input, expected) => {
     expect(Money.from({ amount: input, currency: 'BRL' }).amount).toBe(expected);
   });
 
   test.each([
     ['', 'vazio'],
+    ['25', 'sem casas decimais (escala fixa)'],
+    ['25.5', 'uma casa decimal (escala fixa)'],
+    ['0', 'zero sem casas'],
     ['NaN', 'NaN'],
     ['Infinity', 'Infinity'],
     ['-Infinity', '-Infinity'],
@@ -86,13 +87,13 @@ describe('Money: aritmética exata', () => {
     expect(brl('0.01').isPositive()).toBe(true);
     expect(brl('5.00').isLessThan(brl('5.01'))).toBe(true);
     expect(brl('5.00').isLessThan(brl('5.00'))).toBe(false);
-    expect(brl('5').equals(brl('5.00'))).toBe(true);
+    expect(brl('5.00').equals(brl('5.00'))).toBe(true);
     expect(brl('5.00').equals(usd('5.00'))).toBe(false);
   });
 
   test('serialização: toJSON é MoneyProps com string; toString legível', () => {
-    expect(JSON.stringify(brl('25.5'))).toBe('{"amount":"25.50","currency":"BRL"}');
-    expect(brl('25.5').toString()).toBe('25.50 BRL');
+    expect(JSON.stringify(brl('25.50'))).toBe('{"amount":"25.50","currency":"BRL"}');
+    expect(brl('25.50').toString()).toBe('25.50 BRL');
   });
 });
 

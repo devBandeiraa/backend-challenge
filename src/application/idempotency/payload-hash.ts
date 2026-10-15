@@ -11,7 +11,7 @@ export interface WagerBusinessPayload {
   roundId: string;
   gameId: string;
   kind: string;
-  /** Já normalizado por Money.toJSON(): "25.5" e "25.50" geram o mesmo hash. */
+  /** Validado por Money (escala fixa de 2 casas): uma única grafia por valor. */
   money: MoneyProps;
   referenceExternalTransactionId?: string | undefined;
 }

@@ -13,17 +13,19 @@ export const MONEY_SCALE = 2;
 // Precisão 40 >> 19 dígitos de NUMERIC(19,2), então add/subtract são sempre exatos.
 const D = Decimal.clone({ precision: 40, rounding: Decimal.ROUND_HALF_EVEN, toExpNeg: -40, toExpPos: 40 });
 
-// Até 17 dígitos inteiros (NUMERIC(19,2)), sem zeros à esquerda, 1 ou 2 casas opcionais.
-// Rejeita por construção: sinal, notação científica, NaN/Infinity, vazio, espaços, ".5", "5.".
-const AMOUNT_PATTERN = /^(0|[1-9]\d{0,16})(\.\d{1,2})?$/;
+// Até 17 dígitos inteiros (NUMERIC(19,2)), sem zeros à esquerda, EXATAMENTE 2 casas.
+// Rejeita por construção: "25", "25.5", sinal, notação científica, NaN/Infinity, vazio, espaços, ".50".
+const AMOUNT_PATTERN = /^(0|[1-9]\d{0,16})\.\d{2}$/;
 const CURRENCY_PATTERN = /^[A-Z]{3}$/;
 const MAX_ABS = new D('99999999999999999.99');
 
 /**
  * Valor monetário imutável com escala fixa de 2 casas.
  *
- * Entrada aceita 0–2 casas ("25", "25.5", "25.50") e normaliza para 2; mais de 2 casas é
- * REJEITADO, nunca arredondado: arredondar dinheiro em silêncio esconde erro do provedor.
+ * Contrato de escala fixa (README): amount tem EXATAMENTE 2 casas ("25.00"); "25" e "25.5"
+ * são rejeitados. Mais de 2 casas também, nunca arredondado: arredondar dinheiro em silêncio
+ * esconde erro do provedor. Como há uma única grafia válida por valor, o payloadHash não
+ * depende de normalização.
  * Valores negativos só surgem por aritmética (negate/subtract), nunca pela entrada.
  */
 export class Money {
@@ -37,7 +39,7 @@ export class Money {
     const { amount, currency } = props;
     if (typeof amount !== 'string' || !AMOUNT_PATTERN.test(amount)) {
       throw new InvalidMoneyError(
-        `invalid amount ${JSON.stringify(amount)}: expected non-negative decimal string with up to ${MONEY_SCALE} places`,
+        `invalid amount ${JSON.stringify(amount)}: expected non-negative decimal string with exactly ${MONEY_SCALE} places`,
       );
     }
     return new Money(new D(amount), Money.assertCurrency(currency));

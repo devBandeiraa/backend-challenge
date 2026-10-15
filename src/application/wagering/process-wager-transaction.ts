@@ -51,7 +51,7 @@ export class ProcessWagerTransactionUseCase {
 
   async execute(command: SubmitWagerTransactionCommand, afterSettle?: ScopeHook): Promise<WagerTransactionOutcome> {
     const money = this.parseMoney(command.money);
-    // Hash calculado sobre o Money normalizado: "25.5" e "25.50" são o mesmo payload.
+    // Hash sobre o Money validado: com escala fixa, cada valor tem uma única grafia no contrato.
     const payloadHash = hashWagerPayload({ ...command, money: money.toJSON() });
 
     return this.uow.run(async (scope) => {
