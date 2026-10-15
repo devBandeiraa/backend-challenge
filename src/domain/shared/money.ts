@@ -1,4 +1,5 @@
 import Decimal from 'decimal.js';
+import { isAcceptedCurrency } from './currency';
 import { CurrencyMismatchError, InvalidMoneyError } from './domain-error';
 
 /** DTO de contrato: amount é sempre string decimal, nunca number. */
@@ -34,19 +35,25 @@ export class Money {
     public readonly currency: string,
   ) {}
 
+  /** Entrada (contratos HTTP/SQS, criação de wallet): moeda precisa estar na lista ISO-4217 aceita. */
   static from(props: MoneyProps): Money {
-    if (props === null || typeof props !== 'object') throw new InvalidMoneyError('money must be an object');
-    const { amount, currency } = props;
-    if (typeof amount !== 'string' || !AMOUNT_PATTERN.test(amount)) {
-      throw new InvalidMoneyError(
-        `invalid amount ${JSON.stringify(amount)}: expected non-negative decimal string with exactly ${MONEY_SCALE} places`,
-      );
+    return new Money(Money.parseAmount(props), Money.assertAcceptedCurrency(props.currency));
+  }
+
+  /**
+   * Reidratação do que já foi persistido: mesmo formato exato de valor, mas a moeda só é conferida
+   * no formato. Um dado gravado continua legível mesmo que a lista de moedas aceitas mude depois.
+   */
+  static rehydrate(props: MoneyProps): Money {
+    const amount = Money.parseAmount(props);
+    if (typeof props.currency !== 'string' || !CURRENCY_PATTERN.test(props.currency)) {
+      throw new InvalidMoneyError(`invalid persisted currency ${JSON.stringify(props.currency)}`);
     }
-    return new Money(new D(amount), Money.assertCurrency(currency));
+    return new Money(amount, props.currency);
   }
 
   static zero(currency: string): Money {
-    return new Money(new D(0), Money.assertCurrency(currency));
+    return new Money(new D(0), Money.assertAcceptedCurrency(currency));
   }
 
   add(other: Money): Money {
@@ -109,9 +116,22 @@ export class Money {
     return new Money(value, currency);
   }
 
-  private static assertCurrency(currency: unknown): string {
-    if (typeof currency !== 'string' || !CURRENCY_PATTERN.test(currency)) {
-      throw new InvalidMoneyError(`invalid currency ${JSON.stringify(currency)}: expected ISO-4217 alpha code`);
+  private static parseAmount(props: MoneyProps): Decimal {
+    if (props === null || typeof props !== 'object') throw new InvalidMoneyError('money must be an object');
+    const { amount } = props;
+    if (typeof amount !== 'string' || !AMOUNT_PATTERN.test(amount)) {
+      throw new InvalidMoneyError(
+        `invalid amount ${JSON.stringify(amount)}: expected non-negative decimal string with exactly ${MONEY_SCALE} places`,
+      );
+    }
+    return new D(amount);
+  }
+
+  private static assertAcceptedCurrency(currency: unknown): string {
+    if (!isAcceptedCurrency(currency)) {
+      throw new InvalidMoneyError(
+        `invalid currency ${JSON.stringify(currency)}: expected an ISO-4217 code with 2 minor-unit digits (see currency.ts)`,
+      );
     }
     return currency;
   }

@@ -1,4 +1,5 @@
 import { z } from 'zod';
+import { INTERNAL_PROVIDER_ID } from '../domain/wagering/wager-transaction';
 import { SUBMITTABLE_KINDS } from '../domain/wagering/wager-transaction-kind';
 
 // Contratos de entrada compartilhados por HTTP e SQS (mesmo use case, mesmas regras de forma).
@@ -10,8 +11,13 @@ import { SUBMITTABLE_KINDS } from '../domain/wagering/wager-transaction-kind';
 export const text = (max: number) => z.string().min(1).max(max);
 export const moneySchema = z.object({ amount: z.string(), currency: z.string() }).strict();
 
+/** "internal" é o namespace das transações criadas pelo próprio serviço (OPENING): nenhum provedor o usa. */
+export const providerIdSchema = text(64).refine((v) => v.toLowerCase() !== INTERNAL_PROVIDER_ID, {
+  message: `providerId "${INTERNAL_PROVIDER_ID}" is reserved`,
+});
+
 const wagerFields = {
-  providerId: text(64),
+  providerId: providerIdSchema,
   externalTransactionId: text(128),
   playerId: z.uuid(),
   walletId: z.uuid(),

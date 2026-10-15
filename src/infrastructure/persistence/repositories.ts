@@ -91,8 +91,8 @@ class MikroOrmWalletRepository implements WalletRepository {
     const wallet = toWallet(this.em.map(WalletRecord, row));
     return {
       wallet,
-      credits: Money.from({ amount: row.credits, currency: wallet.currency }),
-      debits: Money.from({ amount: row.debits, currency: wallet.currency }),
+      credits: Money.rehydrate({ amount: row.credits, currency: wallet.currency }),
+      debits: Money.rehydrate({ amount: row.debits, currency: wallet.currency }),
       entries: Number(row.entries),
       lastLedgerVersion: row.last_version ?? undefined,
     };

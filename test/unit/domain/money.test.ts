@@ -46,6 +46,30 @@ describe('Money: entrada', () => {
   test.each([['brl'], ['BR'], ['BRLL'], [''], ['12A']])('rejeita moeda %p', (currency) => {
     expect(() => Money.from({ amount: '1.00', currency })).toThrow(InvalidMoneyError);
   });
+
+  test.each([
+    ['XYZ', 'não existe na ISO-4217'],
+    ['JPY', 'unidade menor de 0 casas'],
+    ['KRW', 'unidade menor de 0 casas'],
+    ['KWD', 'unidade menor de 3 casas'],
+    ['BHD', 'unidade menor de 3 casas'],
+    ['XAU', 'metal, não moeda'],
+    ['XTS', 'código de teste'],
+    ['HRK', 'retirada (euro)'],
+  ])('rejeita moeda fora da lista ISO-4217 de 2 casas: %p (%s)', (currency) => {
+    expect(() => Money.from({ amount: '1.00', currency })).toThrow(/ISO-4217/);
+    expect(() => Money.zero(currency)).toThrow(InvalidMoneyError);
+  });
+
+  test.each([['BRL'], ['USD'], ['EUR'], ['GBP'], ['MXN'], ['ZAR']])('aceita moeda ISO-4217 de 2 casas %p', (currency) => {
+    expect(Money.from({ amount: '1.00', currency }).currency).toBe(currency);
+  });
+
+  test('rehydrate (dado persistido) valida o formato, não a lista: moeda depois retirada continua legível', () => {
+    expect(Money.rehydrate({ amount: '10.00', currency: 'HRK' }).toJSON()).toEqual({ amount: '10.00', currency: 'HRK' });
+    expect(() => Money.rehydrate({ amount: '10.00', currency: 'hrk' })).toThrow(InvalidMoneyError);
+    expect(() => Money.rehydrate({ amount: '10', currency: 'BRL' })).toThrow(InvalidMoneyError);
+  });
 });
 
 describe('Money: aritmética exata', () => {

@@ -189,6 +189,21 @@ describe('erros permanentes → DLQ', () => {
   });
 });
 
+describe('providerId reservado pela fila', () => {
+  test('providerId "internal" no data → DLQ invalid_data, nenhuma transação criada', async () => {
+    const w = await wallet();
+    const cmd = wagerCommand(w, { providerId: 'internal' });
+    await send(wagerMessage(messageData(cmd)).body, w.id);
+    consumer().start();
+    const dlq = await waitFor(async () => {
+      const got = await drain(client, gateway.urls.deadLetter, 500);
+      return got.length > 0 ? got : undefined;
+    });
+    expect(dlq[0]!.attributes.failureReason).toBe('invalid_data');
+    expect(await countRows(app.orm, `wager_transactions WHERE wallet_id = ? AND kind <> 'OPENING'`, [w.id])).toBe(0);
+  });
+});
+
 describe('transitório → retry com backoff → limite → FAILED antes da DLQ', () => {
   test('wallet travada por outra transação: retries medidos, FAILED gravado, DLQ com motivo; replay devolve FAILED', async () => {
     const w = await wallet('100.00');

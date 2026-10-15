@@ -10,14 +10,15 @@ import { WalletLedgerEntry } from '../../domain/wallet/wallet-ledger-entry';
 import type { InboxRecord, LedgerEntryRecord, WagerTransactionRecord, WalletRecord } from './schemas';
 
 // Persistência → domínio sempre via rehydrate (sem revalidar transições).
-// Money.from aceita a string exata do NUMERIC: nenhum valor passa por number.
+// Money.rehydrate aceita a string exata do NUMERIC: nenhum valor passa por number. A moeda persistida
+// é conferida só no formato (a lista de moedas aceitas vale para a ENTRADA).
 
 type WalletRow = InferEntity<typeof WalletRecord>;
 type TxRow = InferEntity<typeof WagerTransactionRecord>;
 type LedgerRow = InferEntity<typeof LedgerEntryRecord>;
 type InboxRow = InferEntity<typeof InboxRecord>;
 
-const money = (amount: string, currency: string) => Money.from({ amount, currency });
+const money = (amount: string, currency: string) => Money.rehydrate({ amount, currency });
 
 export function toWallet(row: WalletRow): Wallet {
   return Wallet.rehydrate({

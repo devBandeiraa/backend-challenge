@@ -66,6 +66,8 @@ describe('POST /wallets', () => {
     ['amount com 3 casas', { playerId: crypto.randomUUID(), initialBalance: { amount: '1.001', currency: 'BRL' } }],
     ['amount negativo', { playerId: crypto.randomUUID(), initialBalance: { amount: '-1.00', currency: 'BRL' } }],
     ['playerId não-uuid', { playerId: 'abc', initialBalance: { amount: '1.00', currency: 'BRL' } }],
+    ['moeda inexistente (XYZ)', { playerId: crypto.randomUUID(), initialBalance: { amount: '1.00', currency: 'XYZ' } }],
+    ['moeda com 0 casas (JPY)', { playerId: crypto.randomUUID(), initialBalance: { amount: '1.00', currency: 'JPY' } }],
     ['campo desconhecido', { playerId: crypto.randomUUID(), initialBalance: { amount: '1.00', currency: 'BRL' }, extra: 1 }],
   ])('400 para %s', async (_label, body) => {
     const res = await call('POST', '/wallets', { body });
@@ -148,6 +150,13 @@ describe('POST /wagering/transactions', () => {
     const res = await submit(txBody(w, { kind: 'REFUND', referenceExternalTransactionId: 'not-yet' }));
     expect(res.status).toBe(202);
     expect(res.body).toMatchObject({ status: 'PENDING_REFERENCE', balance: null, idempotentReplay: false });
+  });
+
+  test.each([['internal'], ['Internal']])('400 para providerId reservado %p (mesmo com wallet inexistente)', async (providerId) => {
+    const res = await submit(txBody({ id: crypto.randomUUID(), playerId: crypto.randomUUID() }, { providerId }));
+    expect(res.status).toBe(400);
+    expect(res.body.error.code).toBe('INVALID_PAYLOAD');
+    expect(JSON.stringify(res.body.error.details)).toContain('reserved');
   });
 
   test('422 WALLET_NOT_FOUND para wallet inexistente', async () => {

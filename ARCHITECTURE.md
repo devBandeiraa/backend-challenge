@@ -225,6 +225,11 @@ O limite de tentativas vale para PENDING_REFERENCE (seção [7.4](#74-worker-de-
   vírgula, valor que não seja string e valor acima da faixa de NUMERIC(19,2).
 - **Negativos:** só por aritmética interna (`negate`/`subtract`, por exemplo a diferença da reconciliação),
   nunca pela entrada.
+- **Moeda:** na entrada (`Money.from`), só códigos ISO-4217 de moedas correntes com unidade menor de **2 casas**
+  ([currency.ts](src/domain/shared/currency.ts)), coerente com a escala fixa. JPY/KRW (0 casas) e KWD/BHD (3 casas)
+  são recusadas: 2 casas fixas criariam centavos inexistentes ou perderiam milésimos. Fundos, metais, códigos de
+  teste e moedas retiradas também ficam fora. A reidratação do banco (`Money.rehydrate`) confere só o formato, para
+  que um dado gravado continue legível se a lista mudar (ex.: uma moeda retirada da ISO).
 - **Persistência:** o Postgres devolve `numeric` como **string**, mapeado com `p.decimal('string')`.
   Em nenhum ponto o valor passa por `number`. Somas de reconciliação são feitas em NUMERIC e devolvidas como texto.
 - **Banco:** `NUMERIC(19,2)` + `currency CHAR(3)`. O FK composto `(wallet_id, currency)` garante que o
@@ -526,6 +531,9 @@ No compose: `init: true` (tini como PID 1, porque o Nest re-emite o sinal após 
   primeira resposta, exceto `idempotentReplay`; há teste para 200, 422 e 202 e para `WALLET_NOT_FOUND`.
   Por isso nenhum corpo de resultado tem campo volátil: o correlationId vai no header `X-Correlation-Id`.
 - **Mapeamento único:** o `HttpErrorFilter` faz o mapeamento categoria → status para todos os endpoints.
+- **`providerId` reservado:** `internal` (sem diferenciar maiúsculas) é o namespace das transações criadas pelo próprio
+  serviço (OPENING) e é recusado com 400 no HTTP e com DLQ (`invalid_data`) na fila, antes de qualquer acesso ao banco;
+  o domínio (`WagerTransaction.create`) recusa também.
 - **zod `strict`:** campo desconhecido gera 400. Num WIN, um typo em `referenceExternalTransactionId`
   seria descartado em silêncio. O conteúdo do dinheiro é validado só pelo `Money` (fonte única).
 - **Cursor do ledger:** `base64url({ w: walletId, v: wallet_version })`, em ordem decrescente.

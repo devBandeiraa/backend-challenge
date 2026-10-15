@@ -104,6 +104,9 @@ export class WagerTransaction {
     if (!(SUBMITTABLE_KINDS as readonly WagerTransactionKind[]).includes(props.kind)) {
       throw new InvalidEntityError(`kind ${props.kind} cannot be submitted`);
     }
+    if (typeof props.providerId === 'string' && props.providerId.toLowerCase() === INTERNAL_PROVIDER_ID) {
+      throw new InvalidEntityError(`providerId "${INTERNAL_PROVIDER_ID}" is reserved for internal transactions`);
+    }
     for (const field of Object.keys(TEXT_LIMITS) as (keyof typeof TEXT_LIMITS)[]) {
       const value = props[field];
       if (typeof value !== 'string' || value.length === 0 || value.length > TEXT_LIMITS[field]) {

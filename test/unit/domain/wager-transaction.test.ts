@@ -23,6 +23,10 @@ describe('WagerTransaction.create', () => {
     expect(() => newTx(wallet, K.Opening)).toThrow(InvalidEntityError);
   });
 
+  test.each([['internal'], ['Internal'], ['INTERNAL']])('providerId %p é reservado às transações internas', (providerId) => {
+    expect(() => newTx(wallet, K.Bet, { providerId })).toThrow(/reserved/);
+  });
+
   test.each([K.Refund, K.Rollback])('%s exige referenceExternalTransactionId', (kind) => {
     expect(() => newTx(wallet, kind)).toThrow(InvalidEntityError);
     expect(newTx(wallet, kind, { referenceExternalTransactionId: 'bet-1' }).requiresReference()).toBe(true);
