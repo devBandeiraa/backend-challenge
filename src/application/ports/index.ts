@@ -33,6 +33,8 @@ export interface WagerTransactionRepository {
   save(tx: WagerTransaction): Promise<void>;
   /** Existe reversão PROCESSED (qualquer kind) para a referência — decisão B. */
   hasProcessedReversal(referenceTransactionId: string): Promise<boolean>;
+  /** Uma PENDING_REFERENCE vencida, travada com FOR UPDATE SKIP LOCKED (linhas de outras instâncias são puladas). */
+  claimDuePendingReference(now: Date): Promise<WagerTransaction | undefined>;
 }
 
 export interface LedgerPage {

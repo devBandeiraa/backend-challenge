@@ -58,6 +58,15 @@ export class UnknownWalletError extends ApplicationError {
   }
 }
 
+/** Mesmo messageId (inbox) com conteúdo diferente: erro permanente do produtor → DLQ. */
+export class InboxPayloadMismatchError extends ApplicationError {
+  readonly category = 'conflict';
+  readonly code = 'INBOX_PAYLOAD_MISMATCH';
+  constructor(readonly messageId: string) {
+    super(`message ${messageId} was already received with a different payload`);
+  }
+}
+
 /** Banco/fila indisponível ou retries de concorrência esgotados: o chamador deve reenviar. */
 export class TransientInfrastructureError extends ApplicationError {
   readonly category = 'transient';
