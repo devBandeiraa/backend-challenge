@@ -599,6 +599,22 @@ Trocar o guard por essa implementação não altera controllers nem use cases.
   com a resposta perdida no kill. Numa execução houve 1; o reenvio com a mesma key devolveu replay, sem
   segundo débito.
 
+**Validação a partir de clone limpo (15/10/2026).** Ambiente zerado (`docker compose down -v --rmi local`)
+e `git clone` num diretório novo, seguindo só o README:
+
+| Passo | Resultado |
+|---|---|
+| `bun install --frozen-lockfile` | 179 pacotes, lockfile respeitado |
+| `bun run infra:up` | Postgres e LocalStack healthy, migrations e filas criadas |
+| `bun run typecheck` | sem erros |
+| `bun run test` | **266 pass, 0 fail** |
+| `bun run test:multi` | **6 pass, 0 fail**, com as imagens construídas do zero |
+| `bun run test:load` (10 s, 500 msgs) | 0 erros, 0 divergências, relatório gerado |
+
+A validação expôs um problema: `infra:up` retornava antes de migrations e filas terminarem (os testes
+compensavam isso sozinhos). O script foi corrigido para esperar os serviços de longa duração e rodar os
+one-shots com `docker compose run --rm`, que devolve o código de saída de cada um.
+
 ---
 
 ## 13. Carga
