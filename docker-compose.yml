@@ -85,9 +85,20 @@ services:
 
   app:
     build: { context: ., dockerfile: docker/app.Dockerfile }
-    environment: *app-env
+    environment:
+      <<: *app-env
+      # Cada réplica tem seu próprio pool, consumer SQS, publisher da outbox e worker de referências.
+      DB_POOL_MAX: "10"
+      SQS_WAIT_TIME_SECONDS: "5"
+      SHUTDOWN_GRACE_MS: "20000"
     deploy:
       replicas: 3
+    # tini como PID 1: o SIGTERM chega à app, e o re-raise do sinal pelo Nest após o
+    # shutdown encerra o processo (PID 1 ignora sinais sem handler).
+    init: true
+    # > SHUTDOWN_GRACE_MS: o consumer conclui o que está em andamento antes do SIGKILL.
+    stop_grace_period: 30s
+    restart: unless-stopped
     depends_on:
       migrate: { condition: service_completed_successfully }
       sqs-init: { condition: service_completed_successfully }
