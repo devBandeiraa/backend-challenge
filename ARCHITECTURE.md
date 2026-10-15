@@ -708,21 +708,25 @@ Trocar o guard por essa implementação não altera controllers nem use cases.
   com a resposta perdida no kill. Numa execução houve 1; o reenvio com a mesma key devolveu replay, sem
   segundo débito.
 
-**Validação a partir de clone limpo (15/10/2026).** Ambiente zerado (`docker compose down -v --rmi local`)
-e `git clone` num diretório novo, seguindo só o README:
+**Validação a partir de clone limpo (15/10/2026, após as correções da auditoria).** `git clone` num diretório
+novo e um projeto Compose isolado (`COMPOSE_PROJECT_NAME`), com volume, banco, papéis do Postgres, filas e imagens
+criados do zero, seguindo só o README:
 
 | Passo | Resultado |
 |---|---|
 | `bun install --frozen-lockfile` | 179 pacotes, lockfile respeitado |
-| `bun run infra:up` | Postgres e LocalStack healthy, migrations e filas criadas |
+| `bun run infra:up` | Postgres e LocalStack healthy; 9 migrations; papel `wagering_app_rw` e login da app criados; filas criadas |
 | `bun run typecheck` | sem erros |
-| `bun run test` | **266 pass, 0 fail** |
+| `bun run test` | **329 pass, 0 fail** |
 | `bun run test:multi` | **6 pass, 0 fail**, com as imagens construídas do zero |
-| `bun run test:load` (10 s, 500 msgs) | 0 erros, 0 divergências, relatório gerado |
+| `bun run test:load` (10 s, 500 msgs) | 228,7 req/s, p99 1,58 s, 0 erros, 0 retries, outbox lag máx 0,18 s, 0 divergências em 201 wallets |
 
-A validação expôs um problema: `infra:up` retornava antes de migrations e filas terminarem (os testes
-compensavam isso sozinhos). O script foi corrigido para esperar os serviços de longa duração e rodar os
-one-shots com `docker compose run --rm`, que devolve o código de saída de cada um.
+**O que as validações expuseram:**
+- 1ª validação: `infra:up` retornava antes de migrations e filas terminarem (os testes compensavam sozinhos). O
+  script passou a esperar os serviços de longa duração e a rodar os one-shots com `docker compose run --rm --build`,
+  que devolve o código de saída de cada um e aplica migrations novas.
+- 2ª validação: o hot-wallet de 200 apostas recebeu `57014` com `statement_timeout` de 15 s, mostrando que nenhum
+  teto fixo convive com a fila do lock de uma hot wallet. O lock da wallet passou a ser isento (§7.3).
 
 ---
 
