@@ -158,11 +158,17 @@ export class WagerTransactionConsumer {
     });
 
     let outcome: MessageOutcome;
+    const stopHeartbeat = this.startHeartbeat(message, log);
     try {
       outcome = await this.useCase.executeFromMessage(command, inbound);
     } catch (error) {
-      return this.handleFailure(message, command, inbound, error, log);
+      try {
+        return await this.handleFailure(message, command, inbound, error, log);
+      } finally {
+        stopHeartbeat();
+      }
     }
+    stopHeartbeat();
 
     // Commit feito. Daqui em diante, falhar significa só redelivery (inbox absorve).
     await this.options.hooks?.afterCommit?.(message, outcome);
@@ -198,16 +204,20 @@ export class WagerTransactionConsumer {
       // (não há transação válida/única a registrar).
       return this.deadLetter(message, error.code, error.message);
     }
-    if (error instanceof TransientInfrastructureError && message.receiveCount < this.options.maxAttempts) {
+    // Transitório OU não classificado: retry com backoff até o limite. FAILED é terminal, então
+    // nunca nasce de um erro desconhecido na 1ª tentativa: um erro "inesperado" pode ser uma
+    // falha de infraestrutura não mapeada (driver, rede) que passa sozinha.
+    const transient = error instanceof TransientInfrastructureError;
+    if (message.receiveCount < this.options.maxAttempts) {
       const delaySeconds = Math.ceil(this.retryBackoff.delayMs(message.receiveCount) / 1000);
       await this.gateway.changeVisibility(message, delaySeconds).catch(() => undefined);
       this.metrics.sqsRetries.inc();
       this.metrics.sqsMessages.inc({ outcome: 'retry' });
-      log.warn({ msg: 'transient failure; message will be retried', delaySeconds, err: error });
+      log.warn({ msg: transient ? 'transient failure; will retry' : 'unexpected failure; will retry', delaySeconds, err: error });
       return 'retry';
     }
-    // Retries transitórios esgotados ou erro inesperado: FAILED (best-effort) e DLQ.
-    const reason = error instanceof TransientInfrastructureError ? 'retries_exhausted' : 'unexpected_error';
+    // Limite de recebimentos atingido: FAILED (best-effort, transação separada) e DLQ.
+    const reason = transient ? 'retries_exhausted' : 'unexpected_error';
     try {
       const failedId = await this.useCase.recordFailure(command, inbound);
       log.error({ msg: 'giving up on message', reason, transactionId: failedId, err: error });
@@ -215,6 +225,23 @@ export class WagerTransactionConsumer {
       log.error({ msg: 'could not record FAILED; dead-lettering anyway', reason, err: error, recordError });
     }
     return this.deadLetter(message, reason, (error as Error)?.message);
+  }
+
+  /**
+   * Heartbeat: enquanto a mensagem é processada, renova a visibilidade a cada 1/3 do timeout.
+   * Protege contra processamento mais lento que o previsto (pausa de GC, banco lento): sem ele,
+   * a mensagem reapareceria para outro consumer no meio do processamento. A inbox e a idempotency
+   * key tornariam isso seguro, mas gastariam um recebimento do limite e um retry à toa.
+   * Se o processo morrer, o heartbeat morre junto e a visibilidade expira normalmente.
+   */
+  private startHeartbeat(message: ReceivedMessage, log: Logger): () => void {
+    const visibility = this.options.visibilityTimeoutSeconds;
+    const timer = setInterval(() => {
+      this.gateway.changeVisibility(message, visibility).catch((error) => {
+        log.warn({ msg: 'visibility heartbeat failed', err: error });
+      });
+    }, Math.max(1_000, Math.floor((visibility * 1_000) / 3)));
+    return () => clearInterval(timer);
   }
 
   private async deadLetter(message: ReceivedMessage, reason: string, detail?: string): Promise<Disposition> {

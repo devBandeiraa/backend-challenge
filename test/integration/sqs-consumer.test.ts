@@ -5,6 +5,7 @@
  */
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import { ExponentialBackoff } from '../../src/domain/messaging/backoff-policy';
+import { AppMetrics } from '../../src/infrastructure/observability/metrics';
 import { createLogger } from '../../src/infrastructure/observability/logger';
 import { type ConsumerOptions, WagerTransactionConsumer } from '../../src/interfaces/sqs/wager-transaction.consumer';
 import {
@@ -213,6 +214,110 @@ describe('transitório → retry com backoff → limite → FAILED antes da DLQ'
     const replay = await app.processTransaction.execute(cmd);
     expect(replay).toMatchObject({ status: 'FAILED', failureCode: 'PROCESSING_FAILED', idempotentReplay: true });
   }, 40_000);
+});
+
+describe('erro NÃO classificado é tratado como transitório até o limite', () => {
+  /** Use case real com falha de programação injetada nas N primeiras chamadas (banco e fila reais). */
+  function flaky(failures: number) {
+    let calls = 0;
+    return {
+      executeFromMessage: (...args: Parameters<typeof app.processTransaction.executeFromMessage>) => {
+        calls += 1;
+        if (calls <= failures) throw new TypeError(`unexpected shape (call ${calls})`);
+        return app.processTransaction.executeFromMessage(...args);
+      },
+      recordFailure: (...args: Parameters<typeof app.processTransaction.recordFailure>) => app.processTransaction.recordFailure(...args),
+    } as unknown as typeof app.processTransaction;
+  }
+
+  test('falha inesperada na 1ª tentativa NÃO gera FAILED: retry e depois PROCESSED', async () => {
+    const w = await wallet('100.00');
+    const cmd = wagerCommand(w, { money: { amount: '10.00', currency: 'BRL' } });
+    await send(wagerMessage(messageData(cmd)).body, w.id);
+    const c = new WagerTransactionConsumer(gateway, flaky(1), app.metrics, logger, {
+      consumerName: 'test-consumer',
+      maxAttempts: 3,
+      waitTimeSeconds: 1,
+      visibilityTimeoutSeconds: 30,
+      batchSize: 10,
+      shutdownGraceMs: 5_000,
+      retryBackoff: new ExponentialBackoff({ baseMs: 1_000, factor: 1, maxMs: 1_000, jitterRatio: 0 }),
+    });
+    running.push(c);
+    c.start();
+    await waitFor(async () => (await statusOf(cmd.idempotencyKey))?.status === 'PROCESSED', 20_000);
+    expect(await drain(client, gateway.urls.deadLetter, 500)).toHaveLength(0);
+    expect(await walletBalance(app.orm, w.id)).toBe('90.00');
+  });
+
+  test('falha inesperada persistente: retries até o limite, só então FAILED + DLQ (unexpected_error)', async () => {
+    const w = await wallet('100.00');
+    const cmd = wagerCommand(w);
+    await send(wagerMessage(messageData(cmd)).body, w.id);
+    const c = new WagerTransactionConsumer(gateway, flaky(Number.MAX_SAFE_INTEGER), app.metrics, logger, {
+      consumerName: 'test-consumer',
+      maxAttempts: 3,
+      waitTimeSeconds: 1,
+      visibilityTimeoutSeconds: 30,
+      batchSize: 10,
+      shutdownGraceMs: 5_000,
+      retryBackoff: new ExponentialBackoff({ baseMs: 1_000, factor: 1, maxMs: 1_000, jitterRatio: 0 }),
+    });
+    running.push(c);
+    c.start();
+    const dlq = await waitFor(async () => {
+      const got = await drain(client, gateway.urls.deadLetter, 500);
+      return got.length > 0 ? got : undefined;
+    }, 30_000);
+    expect(dlq[0]!.attributes).toMatchObject({ failureReason: 'unexpected_error', receiveCount: '3' });
+    expect(await statusOf(cmd.idempotencyKey)).toEqual({ status: 'FAILED', failure_code: 'PROCESSING_FAILED' });
+  });
+});
+
+describe('heartbeat de visibilidade', () => {
+  test('processamento mais longo que o visibility timeout: outro consumer NÃO recebe a mensagem', async () => {
+    const w = await wallet('100.00');
+    const cmd = wagerCommand(w, { money: { amount: '10.00', currency: 'BRL' } });
+    const slowApp = await createAppContext({ poolMax: 4, uow: { maxAttempts: 1, lockTimeoutMs: 15_000 } });
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    let locked!: () => void;
+    const isLocked = new Promise<void>((r) => (locked = r));
+    const holder = app.orm.em.fork().transactional(async (em) => {
+      await em.execute(`SELECT id FROM wallets WHERE id = ? FOR NO KEY UPDATE`, [w.id]);
+      locked();
+      await released;
+    });
+    await isLocked;
+
+    await send(wagerMessage(messageData(cmd)).body, w.id);
+    const options = {
+      consumerName: 'test-consumer',
+      maxAttempts: 3,
+      waitTimeSeconds: 1,
+      visibilityTimeoutSeconds: 2, // processamento vai durar ~6s: 3× o timeout
+      batchSize: 10,
+      shutdownGraceMs: 15_000,
+    };
+    const metricsA = new AppMetrics();
+    const metricsB = new AppMetrics();
+    const a = new WagerTransactionConsumer(gateway, slowApp.processTransaction, metricsA, logger, options);
+    a.start();
+    await Bun.sleep(1_500); // A recebeu e está esperando o lock
+    const b = new WagerTransactionConsumer(gateway, app.processTransaction, metricsB, logger, options);
+    b.start();
+    await Bun.sleep(4_500); // > 2× visibility timeout: sem heartbeat, B já teria recebido
+    release();
+    await holder;
+    await waitFor(async () => (await statusOf(cmd.idempotencyKey))?.status === 'PROCESSED', 10_000);
+    await Promise.all([a.stop(), b.stop()]);
+
+    const handledByB = (await metricsB.sqsMessages.get()).values.reduce((s, v) => s + v.value, 0);
+    expect(handledByB).toBe(0);
+    expect((await metricsA.sqsMessages.get()).values.find((v) => v.labels.outcome === 'processed')?.value).toBe(1);
+    expect(await walletBalance(app.orm, w.id)).toBe('90.00');
+    await slowApp.close();
+  });
 });
 
 describe('shutdown (SIGTERM)', () => {
