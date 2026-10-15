@@ -104,6 +104,120 @@ O backoff exponencial tem teto, e o evento nunca é descartado (perder evento co
 O atraso fica visível na métrica de outbox lag. O limite de tentativas vale para PENDING_REFERENCE:
 ao esgotar, a transação vira `REJECTED`/`REFERENCE_NOT_FOUND` e o evento correspondente é publicado.
 
+## Decisões da Fase 1 (domínio, aplicação, HTTP)
+
+### Money
+- `decimal.js` num construtor **isolado** (`Decimal.clone`, precisão 40), que não altera a configuração global da lib.
+  Com 19 dígitos de NUMERIC(19,2), `add`/`subtract` são sempre exatos.
+- **Entrada:** aceita de 0 a 2 casas e normaliza para 2 (`"25.5"` vira `"25.50"`). Mais de 2 casas é
+  **rejeitado, nunca arredondado**, porque arredondar dinheiro em silêncio esconde erro do provedor.
+- **Também rejeitados:** sinal, notação científica, `NaN`/`Infinity`, vazio, zero à esquerda, espaços,
+  vírgula, valor que não seja string e qualquer valor acima da faixa de NUMERIC(19,2).
+- Negativos só surgem por aritmética interna (`negate`/`subtract`), nunca pela entrada.
+- O banco devolve `numeric` como **string**, mapeado com `p.decimal('string')`. Em nenhum ponto
+  entre o Postgres e o `Money` o valor passa por `number`.
+- O payloadHash é calculado sobre o `Money` normalizado, então `"25.5"` e `"25.50"` são o mesmo payload.
+
+### payloadHash
+`hex(SHA-256(UTF-8(canonicalJson({ v: "wager-payload/v1", ...campos de negócio }))))`
+- **Campos de negócio:** providerId, externalTransactionId, playerId, walletId, roundId, gameId, kind,
+  money{amount,currency}, referenceExternalTransactionId.
+- **Fora do hash:** o header Idempotency-Key, messageId, occurredAt e correlationId.
+- **JSON canônico:** chaves ordenadas recursivamente, propriedades `undefined` omitidas e `number`
+  proibido (serialização de float não é canônica entre runtimes).
+- A versão do algoritmo entra no conteúdo hasheado, o que permite evoluí-lo sem colidir com hashes antigos.
+
+### Regras de negócio: interpretações adotadas
+- **Ordem de verificação (`SettlementPolicy`):**
+  1. player e moeda da wallet;
+  2. contexto da referência;
+  3. kind da referência;
+  4. status da referência;
+  5. valor e reversão anterior;
+  6. saldo.
+
+  O que invalida a operação para sempre é verificado antes do que depende de estado.
+- **WIN e LOSS podem referenciar a BET da rodada** (opcional). Quando referenciam, valem as mesmas
+  checagens de contexto e kind (só BET), mas **sem** igualdade de valor (um WIN pode pagar qualquer valor).
+  Se a referência não chegou, a transação fica em PENDING_REFERENCE.
+- **LOSS** aceita valor `0.00` ou positivo, não gera lançamento, não altera `version` e gera só `WagerTransactionProcessed`.
+- **Referência de outra wallet, player ou rodada** é rejeitada com `REFERENCE_MISMATCH` **sem gravar**
+  `reference_transaction_id`, porque a FK composta só aceita referência da mesma wallet.
+- **Referência existente, mas PENDING/PENDING_REFERENCE** (ex.: ROLLBACK de um REFUND que ainda espera a BET):
+  a transação também aguarda.
+- **Referência REJECTED/FAILED:** rejeitada com `REFERENCE_NOT_PROCESSED`.
+- **Snapshot do resultado** (`result_balance`, `result_wallet_version`) é gravado em toda transação PROCESSED
+  e REJECTED. É o que o replay devolve ("o saldo observado naquele momento"), inclusive para LOSS e
+  REJECTED, que não têm ledger. Na rejeição por moeda, o saldo vem na moeda da wallet.
+
+### Taxonomia de failureCode
+| Código | Ação do provedor | Quando |
+|---|---|---|
+| `INSUFFICIENT_FUNDS` | retry_later (nova transação) | BET maior que o saldo |
+| `REVERSAL_WOULD_OVERDRAW` | give_up (operacional) | ROLLBACK que debitaria (de WIN/REFUND) deixaria saldo negativo |
+| `REFERENCE_NOT_FOUND` | fix_payload | referência não chegou dentro da janela de retry |
+| `REFERENCE_MISMATCH` | fix_payload | referência de outro player/wallet/moeda/rodada |
+| `REFERENCE_ALREADY_REVERSED` | give_up | já existe reversão efetiva (decisão B) |
+| `REFERENCE_NOT_PROCESSED` | give_up | referência REJECTED/FAILED |
+| `AMOUNT_MISMATCH` | fix_payload | valor da reversão difere do valor da referência |
+| `CURRENCY_MISMATCH` | fix_payload | moeda da operação difere da wallet |
+| `INVALID_REFERENCE_KIND` | fix_payload | REFUND→BET; ROLLBACK→BET/WIN/REFUND; WIN/LOSS→BET |
+| `PLAYER_MISMATCH` | fix_payload | wallet não pertence ao player |
+| `WALLET_NOT_FOUND` | fix_payload | walletId inexistente (não persistido) |
+| `PROCESSING_FAILED` | retry_later (nova transação) | status FAILED |
+
+Toda rejeição é terminal **para aquela Idempotency-Key**: reenviar com a mesma key devolve o mesmo
+resultado. "retry_later" significa enviar uma nova transação. O catálogo está em
+[failure-code.ts](src/domain/wagering/failure-code.ts).
+
+### HTTP: um mapeamento para todos os endpoints
+| Status | Significado | O provedor deve |
+|---|---|---|
+| 200 | PROCESSED (primeira vez **ou** replay; `idempotentReplay` distingue) | seguir |
+| 201 | wallet criada | seguir |
+| 202 | PENDING_REFERENCE | aguardar; consultar o GET ou o evento |
+| 400 | payload/header/parâmetro inválido (zod `strict` + validação do Money) | corrigir |
+| 404 | recurso de consulta inexistente | — |
+| 409 | `IDEMPOTENCY_KEY_PAYLOAD_MISMATCH`, `EXTERNAL_TRANSACTION_ID_CONFLICT`, `WALLET_ALREADY_EXISTS` | não reenviar igual |
+| 422 | REJECTED/FAILED com `failureCode`; mesmo corpo no replay | ver taxonomia |
+| 503 | falha transitória (`Retry-After`) | reenviar com a **mesma** key |
+
+- **Status do replay:** sai do **resultado**, então o replay recebe o mesmo status da primeira resposta
+  ("requisição idêntica → mesma resposta").
+- **Erros:** um único `HttpErrorFilter` faz o mapeamento categoria→status. Controllers não escolhem
+  status de erro.
+- **Campos desconhecidos:** o zod `strict` responde 400. Num WIN, um typo em
+  `referenceExternalTransactionId` seria descartado em silêncio.
+
+### Persistência e transação
+- **Isolamento:** READ COMMITTED + `FOR NO KEY UPDATE` na wallet. A serialização vem do lock por wallet,
+  não do nível de isolamento. Com SERIALIZABLE, todo conflito em hot wallet viraria abort (`40001`) e
+  retry caro, em vez de uma espera curta.
+- **Escritas:** nativas (`em.insert`/`nativeUpdate`) em vez de `flush` do Unit of Work, porque a ordem
+  dos comandos importa (FKs e o trigger de encadeamento do ledger) e precisa ficar explícita.
+  O `em.transactional` continua definindo a fronteira da transação.
+- **Leituras:** `disableIdentityMap`, para sempre ver o estado confirmado/travado no banco.
+- **Retry da unit of work:** repete a transação inteira para `40001`, `40P01`, `55P03` e para a violação de
+  `wt_single_reversal_uq`. São até 5 tentativas, com backoff de 10 a 200 ms e jitter, cada uma num `fork`
+  novo do EntityManager. Esgotadas as tentativas, ou com o banco inacessível, a resposta é 503.
+- **Classificação de erros:** por SQLSTATE e nome de constraint, nunca por mensagem. Os triggers usam
+  SQLSTATEs próprios (`WL001`–`WL004`, `WT001`).
+- **Wallet inexistente:** verificada **sem lock** antes do insert-first. Como wallets nunca são apagadas
+  (trigger), o resultado não fica obsoleto, e evita que a FK aborte a transação.
+- **Ids:** UUIDv7 (`Bun.randomUUIDv7`), ordenáveis por tempo (localidade de índice) e sem coordenação entre instâncias.
+
+### Ledger: paginação
+- **Cursor opaco:** `base64url({ w: walletId, v: wallet_version })`, em ordem decrescente.
+- **Estabilidade:** `wallet_version` é imutável e único por wallet, então novos lançamentos não deslocam
+  as páginas, diferente de OFFSET. Isso tem teste.
+- **Reuso indevido:** um cursor de outra wallet resulta em 400.
+
+### Fronteiras (hexagonal)
+- **`domain/`:** sem Nest e sem ORM. Recebe ids e datas de fora (`IdGenerator`, `Clock`), o que o mantém determinístico.
+- **`application/`:** casos de uso como classes puras. O Nest só as monta por factory (`app.module.ts`).
+- **`infrastructure/`:** os registros de persistência (`defineEntity`) são separados dos agregados.
+  A reidratação passa sempre por `rehydrate`.
+
 ## Stack e ambiente
 
 | Item | Versão | Observação |
