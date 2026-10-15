@@ -109,14 +109,15 @@ ao esgotar, a transação vira `REJECTED`/`REFERENCE_NOT_FOUND` e o evento corre
 ### Money
 - `decimal.js` num construtor **isolado** (`Decimal.clone`, precisão 40), que não altera a configuração global da lib.
   Com 19 dígitos de NUMERIC(19,2), `add`/`subtract` são sempre exatos.
-- **Entrada:** aceita de 0 a 2 casas e normaliza para 2 (`"25.5"` vira `"25.50"`). Mais de 2 casas é
-  **rejeitado, nunca arredondado**, porque arredondar dinheiro em silêncio esconde erro do provedor.
+- **Escala fixa no contrato**, como diz o README: `amount` tem **exatamente 2 casas** (`"25.00"`).
+  `"25"` e `"25.5"` são rejeitados com 400. Mais de 2 casas também é **rejeitado, nunca arredondado**,
+  porque arredondar dinheiro em silêncio esconde erro do provedor.
 - **Também rejeitados:** sinal, notação científica, `NaN`/`Infinity`, vazio, zero à esquerda, espaços,
   vírgula, valor que não seja string e qualquer valor acima da faixa de NUMERIC(19,2).
 - Negativos só surgem por aritmética interna (`negate`/`subtract`), nunca pela entrada.
 - O banco devolve `numeric` como **string**, mapeado com `p.decimal('string')`. Em nenhum ponto
   entre o Postgres e o `Money` o valor passa por `number`.
-- O payloadHash é calculado sobre o `Money` normalizado, então `"25.5"` e `"25.50"` são o mesmo payload.
+- Como cada valor tem uma única grafia válida no contrato, o payloadHash não depende de normalização.
 
 ### payloadHash
 `hex(SHA-256(UTF-8(canonicalJson({ v: "wager-payload/v1", ...campos de negócio }))))`
@@ -137,10 +138,23 @@ ao esgotar, a transação vira `REJECTED`/`REFERENCE_NOT_FOUND` e o evento corre
   6. saldo.
 
   O que invalida a operação para sempre é verificado antes do que depende de estado.
-- **WIN e LOSS podem referenciar a BET da rodada** (opcional). Quando referenciam, valem as mesmas
+- **WIN pode referenciar a BET da rodada** (o README diz "pode"). Quando referencia, valem as mesmas
   checagens de contexto e kind (só BET), mas **sem** igualdade de valor (um WIN pode pagar qualquer valor).
   Se a referência não chegou, a transação fica em PENDING_REFERENCE.
+- **⚠️ Extensão: LOSS com referência.** O README não prevê referência em LOSS. Aceito opcionalmente,
+  com as mesmas regras do WIN, porque um provedor que liga o resultado à aposta deve receber a mesma
+  validação de contexto (player/wallet/moeda/rodada e kind BET) em vez de ter a referência ignorada.
+  Sem referência, LOSS funciona exatamente como o README descreve.
 - **LOSS** aceita valor `0.00` ou positivo, não gera lançamento, não altera `version` e gera só `WagerTransactionProcessed`.
+- **⚠️ WIN rejeitado por referência ausente.** Um WIN **com** `referenceExternalTransactionId` cuja BET
+  nunca chega fica em PENDING_REFERENCE durante a janela do worker (10 tentativas, cerca de 3 min). Esgotada
+  a janela, vira `REJECTED`/`REFERENCE_NOT_FOUND`, **sem crédito**, e o evento `WagerTransactionRejected`
+  é publicado.
+  - **Consequência:** a referência declarada é tratada como pré-condição. Não creditar um prêmio cuja
+    aposta não existe é o comportamento conservador: nunca credita dinheiro que não deveria.
+  - **Contrapartida:** um prêmio legítimo com referência errada fica retido. O provedor precisa reenviar
+    o WIN com novo `externalTransactionId`, seja sem referência, seja com a referência correta.
+  - **Mesma regra para LOSS:** se a referência não chegar, é rejeitado igualmente, sem efeito financeiro.
 - **Referência de outra wallet, player ou rodada** é rejeitada com `REFERENCE_MISMATCH` **sem gravar**
   `reference_transaction_id`, porque a FK composta só aceita referência da mesma wallet.
 - **Referência existente, mas PENDING/PENDING_REFERENCE** (ex.: ROLLBACK de um REFUND que ainda espera a BET):
@@ -182,8 +196,9 @@ resultado. "retry_later" significa enviar uma nova transação. O catálogo est�
 | 422 | REJECTED/FAILED com `failureCode`; mesmo corpo no replay | ver taxonomia |
 | 503 | falha transitória (`Retry-After`) | reenviar com a **mesma** key |
 
-- **Status do replay:** sai do **resultado**, então o replay recebe o mesmo status da primeira resposta
-  ("requisição idêntica → mesma resposta").
+- **Status do replay:** sai do **resultado**, então o replay recebe o mesmo status **e** o mesmo corpo
+  da primeira resposta, exceto `idempotentReplay`. Há teste para 200, 422 e 202 e para `WALLET_NOT_FOUND`.
+  Por isso nenhum corpo de resultado carrega campo volátil: o correlationId vai só no header `X-Correlation-Id`.
 - **Erros:** um único `HttpErrorFilter` faz o mapeamento categoria→status. Controllers não escolhem
   status de erro.
 - **Campos desconhecidos:** o zod `strict` responde 400. Num WIN, um typo em
@@ -198,8 +213,17 @@ resultado. "retry_later" significa enviar uma nova transação. O catálogo est�
   O `em.transactional` continua definindo a fronteira da transação.
 - **Leituras:** `disableIdentityMap`, para sempre ver o estado confirmado/travado no banco.
 - **Retry da unit of work:** repete a transação inteira para `40001`, `40P01`, `55P03` e para a violação de
-  `wt_single_reversal_uq`. São até 5 tentativas, com backoff de 10 a 200 ms e jitter, cada uma num `fork`
-  novo do EntityManager. Esgotadas as tentativas, ou com o banco inacessível, a resposta é 503.
+  `wt_single_reversal_uq`. São até 5 tentativas (`UOW_MAX_ATTEMPTS`), com backoff de 10 a 200 ms e jitter,
+  cada uma num `fork` novo do EntityManager.
+  - **Métrica:** **cada retry** incrementa `wagering_db_lock_conflicts_total{sqlstate}`.
+  - **Esgotadas as tentativas:** incrementa `wagering_db_retries_exhausted_total`, e o HTTP responde
+    **503 com `Retry-After: 1`**. Com o banco inacessível, a resposta também é 503.
+- **`lock_timeout` por transação:** `SET LOCAL lock_timeout`, 5 s por padrão (`DB_LOCK_TIMEOUT_MS`).
+  Sem teto, uma hot wallet sob carga extrema empilharia conexões esperando indefinidamente. Com ele,
+  a espera vira `55P03`, que segue para retry com backoff e, se persistir, para 503: uma degradação
+  explícita e mensurável. O teste [transient-failures.test.ts](test/integration/transient-failures.test.ts)
+  segura um lock real sobre a wallet e verifica o 503, o `Retry-After`, um incremento da métrica por retry
+  e, depois do release, o reenvio com a mesma key processando normalmente.
 - **Classificação de erros:** por SQLSTATE e nome de constraint, nunca por mensagem. Os triggers usam
   SQLSTATEs próprios (`WL001`–`WL004`, `WT001`).
 - **Wallet inexistente:** verificada **sem lock** antes do insert-first. Como wallets nunca são apagadas
