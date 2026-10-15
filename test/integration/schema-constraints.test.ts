@@ -45,17 +45,17 @@ const insertWallet = (id: string, balance = '0', player = uuid(), currency = 'BR
   [id, player, currency, balance],
 ];
 
-const insertTx = (o: { id?: string; walletId: string; kind?: string; status?: string; amount?: string; ext?: string; key?: string; provider?: string; refExt?: string | null; refId?: string | null; extra?: string }): [string, unknown[]] => {
+const insertTx = (o: { id?: string; walletId: string; kind?: string; status?: string; amount?: string; ext?: string; key?: string; provider?: string; currency?: string; refExt?: string | null; refId?: string | null; extra?: string }): [string, unknown[]] => {
   const id = o.id ?? uuid();
   const ext = o.ext ?? `ext-${id}`;
   return [
     `INSERT INTO wager_transactions (id, provider_id, external_transaction_id, idempotency_key, payload_hash, wallet_id, player_id,
        round_id, game_id, kind, amount, currency, reference_external_transaction_id, reference_transaction_id, status, correlation_id,
        processed_at, result_balance, result_balance_currency, result_wallet_version)
-     VALUES (?, ?, ?, ?, ?, ?, ?, 'r', 'g', ?, ?, 'BRL', ?, ?, ?, 'c', ${
+     VALUES (?, ?, ?, ?, ?, ?, ?, 'r', 'g', ?, ?, ?, ?, ?, ?, 'c', ${
        (o.status ?? 'PENDING') === 'PROCESSED' ? `now(), 0, 'BRL', 1` : 'NULL, NULL, NULL, NULL'
      })`,
-    [id, o.provider ?? 'p', ext, o.key ?? `key-${ext}`, HASH, o.walletId, uuid(), o.kind ?? 'BET', o.amount ?? '10', o.refExt ?? null, o.refId ?? null, o.status ?? 'PENDING'],
+    [id, o.provider ?? 'p', ext, o.key ?? `key-${ext}`, HASH, o.walletId, uuid(), o.kind ?? 'BET', o.amount ?? '10', o.currency ?? 'BRL', o.refExt ?? null, o.refId ?? null, o.status ?? 'PENDING'],
   ];
 };
 
@@ -138,7 +138,7 @@ describe('wallet_ledger_entries', () => {
     const txId = uuid();
     expect(
       await sqlState([
-        insertTx({ id: txId, walletId, status: 'PENDING' }),
+        insertTx({ id: txId, walletId, status: 'PROCESSED' }),
         [`INSERT INTO wallet_ledger_entries (id, wallet_id, transaction_id, wallet_version, direction, amount, currency, balance_before, balance_after)
           VALUES (?, ?, ?, 2, 'DEBIT', 10, 'BRL', 50, 40)`, [uuid(), walletId, txId]],
       ]),
@@ -149,11 +149,66 @@ describe('wallet_ledger_entries', () => {
     const { walletId, txId } = await walletWithBalance('100.00');
     expect(
       await sqlState([
-        [`UPDATE wallets SET balance = 90, version = 2 WHERE id = ?`, [walletId]],
+        [`UPDATE wallets SET balance = 200, version = 2 WHERE id = ?`, [walletId]],
         [`INSERT INTO wallet_ledger_entries (id, wallet_id, transaction_id, wallet_version, direction, amount, currency, balance_before, balance_after)
-          VALUES (?, ?, ?, 2, 'DEBIT', 10, 'BRL', 100, 90)`, [uuid(), walletId, txId]],
+          VALUES (?, ?, ?, 2, 'CREDIT', 100, 'BRL', 100, 200)`, [uuid(), walletId, txId]],
       ]),
     ).toBe('23505');
+  });
+
+  describe('lançamento coerente com a transação (WL005)', () => {
+    /** Lançamento aritmeticamente válido e encadeado (v2, a partir de 100.00): só a coerência pode falhar. */
+    const entry = (walletId: string, txId: string, direction: 'DEBIT' | 'CREDIT', amount = '10'): [string, unknown[]] => [
+      `INSERT INTO wallet_ledger_entries (id, wallet_id, transaction_id, wallet_version, direction, amount, currency, balance_before, balance_after)
+       VALUES (?, ?, ?, 2, ?, ?, 'BRL', 100, 100 ${direction === 'DEBIT' ? '-' : '+'} ?::numeric)`,
+      [uuid(), walletId, txId, direction, amount, amount],
+    ];
+
+    test('transação REJECTED não gera lançamento', async () => {
+      const { walletId } = await walletWithBalance('100.00');
+      const txId = uuid();
+      expect(
+        await sqlState([
+          insertTx({ id: txId, walletId }),
+          [`UPDATE wager_transactions SET status = 'REJECTED', failure_code = 'INSUFFICIENT_FUNDS', result_balance = 100,
+                   result_balance_currency = 'BRL', result_wallet_version = 1 WHERE id = ?`, [txId]],
+          entry(walletId, txId, 'DEBIT'),
+        ]),
+      ).toBe('WL005');
+    });
+
+    test('transação ainda PENDING não gera lançamento', async () => {
+      const { walletId } = await walletWithBalance('100.00');
+      const txId = uuid();
+      expect(await sqlState([insertTx({ id: txId, walletId }), entry(walletId, txId, 'DEBIT')])).toBe('WL005');
+    });
+
+    test('LOSS não gera lançamento', async () => {
+      const { walletId } = await walletWithBalance('100.00');
+      const txId = uuid();
+      expect(await sqlState([insertTx({ id: txId, walletId, kind: 'LOSS', status: 'PROCESSED' }), entry(walletId, txId, 'DEBIT')])).toBe('WL005');
+    });
+
+    test('valor diferente do da transação', async () => {
+      const { walletId } = await walletWithBalance('100.00');
+      const txId = uuid();
+      expect(await sqlState([insertTx({ id: txId, walletId, status: 'PROCESSED' }), entry(walletId, txId, 'DEBIT', '20')])).toBe('WL005');
+    });
+
+    test('direção incoerente com o kind: BET creditando', async () => {
+      const { walletId } = await walletWithBalance('100.00');
+      const txId = uuid();
+      expect(await sqlState([insertTx({ id: txId, walletId, status: 'PROCESSED' }), entry(walletId, txId, 'CREDIT')])).toBe('WL005');
+    });
+
+    test('ROLLBACK de BET precisa CREDITAR (inverso da referência)', async () => {
+      const { walletId } = await walletWithBalance('100.00');
+      const betId = uuid();
+      const rollbackId = uuid();
+      const bet = insertTx({ id: betId, walletId, status: 'PROCESSED', ext: `bet-${betId}` });
+      const rollback = insertTx({ id: rollbackId, walletId, kind: 'ROLLBACK', status: 'PROCESSED', refExt: `bet-${betId}`, refId: betId });
+      expect(await sqlState([bet, rollback, entry(walletId, rollbackId, 'DEBIT')])).toBe('WL005');
+    });
   });
 
   test('FK composta: lançamento na moeda da wallet', async () => {
@@ -161,7 +216,7 @@ describe('wallet_ledger_entries', () => {
     const txId = uuid();
     expect(
       await sqlState([
-        insertTx({ id: txId, walletId }),
+        insertTx({ id: txId, walletId, status: 'PROCESSED', currency: 'USD' }),
         [`INSERT INTO wallet_ledger_entries (id, wallet_id, transaction_id, wallet_version, direction, amount, currency, balance_before, balance_after)
           VALUES (?, ?, ?, 2, 'DEBIT', 10, 'USD', 100, 90)`, [uuid(), walletId, txId]],
       ]),

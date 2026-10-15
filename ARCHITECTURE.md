@@ -95,7 +95,7 @@ Todos os testes usam **Postgres e LocalStack reais**. "e2e" = `bun run test:mult
 | 1 wallet por player+moeda; `version` começa em 1 e só sobe com saldo (6.2) | `UNIQUE (player_id, currency)`; trigger `wallets_guard` | [schema-constraints.test.ts](test/integration/schema-constraints.test.ts), [wallet.test.ts](test/unit/domain/wallet.test.ts), [use-cases.test.ts](test/integration/use-cases.test.ts) (LOSS não muda version) |
 | Estados terminais e transições (6.3) | `WagerTransaction` + trigger `wager_transactions_guard` | [wager-transaction.test.ts](test/unit/domain/wager-transaction.test.ts), [schema-constraints.test.ts](test/integration/schema-constraints.test.ts) ("estado terminal é imutável") |
 | OPENING interno, na mesma transação SQL (6.3, 9) | `OpenWalletUseCase` | [use-cases.test.ts](test/integration/use-cases.test.ts) (wallet v1 + OPENING + CREDIT + 2 eventos) |
-| Ledger imutável estrutural, 1 lançamento por wallet (6.4) | `Object.freeze`, `UNIQUE (transaction_id, wallet_id)` | [wallet.test.ts](test/unit/domain/wallet.test.ts) ("imutabilidade estrutural"), [schema-constraints.test.ts](test/integration/schema-constraints.test.ts) |
+| Ledger imutável estrutural, 1 lançamento por wallet; LOSS e REJECTED sem lançamento (6.4) | `Object.freeze`, `UNIQUE (transaction_id, wallet_id)`, trigger `ledger_matches_transaction` (WL005) | [wallet.test.ts](test/unit/domain/wallet.test.ts) ("imutabilidade estrutural"), [schema-constraints.test.ts](test/integration/schema-constraints.test.ts) |
 | Regras BET/WIN/LOSS/REFUND/ROLLBACK (7) | [settlement-policy.ts](src/domain/wagering/settlement-policy.ts) | [settlement-policy.test.ts](test/unit/domain/settlement-policy.test.ts), [use-cases.test.ts](test/integration/use-cases.test.ts) |
 | Reversão única; valor igual; mesmo contexto (7.2–7.5) | política + `wt_single_reversal_uq` + FK composta de referência | [settlement-policy.test.ts](test/unit/domain/settlement-policy.test.ts), [hot-wallet.test.ts](test/concurrency/hot-wallet.test.ts) ("REFUND e ROLLBACK da MESMA BET em paralelo") |
 | Reversão que estoura saldo, código distinto (7.9) | `REVERSAL_WOULD_OVERDRAW` | [settlement-policy.test.ts](test/unit/domain/settlement-policy.test.ts), [use-cases.test.ts](test/integration/use-cases.test.ts) |
@@ -311,6 +311,7 @@ Cada uma das garantias abaixo tem teste só com SQL em [schema-constraints.test.
 | Uma wallet por player+moeda | `UNIQUE (player_id, currency)` |
 | Idempotência | `UNIQUE (provider_id, idempotency_key)` (migration 007), `UNIQUE (provider_id, external_transaction_id)` |
 | No máximo um lançamento por transação | `UNIQUE (transaction_id, wallet_id)` no ledger |
+| Lançamento coerente com a transação: só de transação `PROCESSED`, nunca de LOSS, mesmo valor e moeda, direção do kind (ROLLBACK = inverso da referência) | trigger `ledger_matches_transaction` (`WL005`, migration 009) |
 | Aritmética do lançamento | `CHECK (balance_before ± amount = balance_after)` |
 | Ledger append-only | trigger bloqueia UPDATE, DELETE e TRUNCATE (`WL001`) |
 | Ledger encadeado | trigger: `balance_before` = `balance_after` anterior; `UNIQUE (wallet_id, wallet_version)` |
