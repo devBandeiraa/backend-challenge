@@ -82,7 +82,7 @@ Todos os testes usam **Postgres e LocalStack reais**. "e2e" = `bun run test:mult
 | Idempotência só em memória | só existe no banco: unicidade + snapshot do resultado na própria linha | [use-cases.test.ts](test/integration/use-cases.test.ts) (replay devolve saldo daquele momento), [restart-consistency.test.ts](test/recovery/restart-consistency.test.ts) (replay após restart) |
 | Correto só com 1 instância | nenhum estado em memória; locks e unicidade no Postgres; `SKIP LOCKED` nos workers | [same-operation.test.ts](test/concurrency/same-operation.test.ts) (3 pools), e2e (3 réplicas, `X-Instance-Id`), [pending-reference-worker.test.ts](test/integration/pending-reference-worker.test.ts) "duas instâncias", [outbox-publisher.test.ts](test/integration/outbox-publisher.test.ts) "DOIS publishers" |
 | Publicar evento antes do commit | eventos só são gravados na outbox, na mesma transação; o publisher só lê linhas confirmadas | [settle-transaction.ts](src/application/wagering/settle-transaction.ts), [outbox-publisher.test.ts](test/integration/outbox-publisher.test.ts) |
-| Ledger não auditável | append-only por trigger (UPDATE/DELETE/TRUNCATE), encadeamento `balance_before = balance_after` anterior, `CHECK` aritmético, versão por lançamento, verificação deferred saldo↔ledger | [004-integrity-triggers.ts](src/infrastructure/persistence/migrations/004-integrity-triggers.ts), [schema-constraints.test.ts](test/integration/schema-constraints.test.ts), [reconciliation.test.ts](test/integration/reconciliation.test.ts) |
+| Ledger não auditável | append-only por trigger (UPDATE/DELETE/TRUNCATE) **e por privilégio** (a app só tem SELECT/INSERT no ledger e não é superuser nem dona das tabelas), encadeamento `balance_before = balance_after` anterior, `CHECK` aritmético, versão por lançamento, verificação deferred saldo↔ledger | [004-integrity-triggers.ts](src/infrastructure/persistence/migrations/004-integrity-triggers.ts), [schema-constraints.test.ts](test/integration/schema-constraints.test.ts), [reconciliation.test.ts](test/integration/reconciliation.test.ts), [db-privileges.test.ts](test/integration/db-privileges.test.ts) |
 | Testes que mockam Postgres/SQS | nenhum mock de banco ou fila; filas exclusivas por teste; processos reais para crash/restart | [test/](test/), seção [12](#12-testes) |
 
 ### 2.2 Requisitos do enunciado
@@ -105,7 +105,7 @@ Todos os testes usam **Postgres e LocalStack reais**. "e2e" = `bun run test:mult
 | failureCodes estáveis (7.2) | [failure-code.ts](src/domain/wagering/failure-code.ts) | seção [4.4](#44-taxonomia-de-failurecode) |
 | Concorrência por wallet; cenário 100/80/80 (8) | `FOR NO KEY UPDATE` (decisão A) | [hot-wallet.test.ts](test/concurrency/hot-wallet.test.ts), [distinct-wallets.test.ts](test/concurrency/distinct-wallets.test.ts) ("wallet A travada não bloqueia B"), [wallet-lock-mode.test.ts](test/integration/wallet-lock-mode.test.ts), e2e |
 | ≥ 3 instâncias (8, 13) | compose `replicas: 3` + nginx | e2e [multi-instance.e2e.ts](test/e2e/multi-instance.e2e.ts) |
-| Unicidade, imutabilidade e não-negatividade **no schema** (5.9) | migrations 001–005 | [schema-constraints.test.ts](test/integration/schema-constraints.test.ts) (20 testes só com SQL) |
+| Unicidade, imutabilidade e não-negatividade **no schema** (5.9) | migrations 001–008 | [schema-constraints.test.ts](test/integration/schema-constraints.test.ts) (20 testes só com SQL) |
 | Migrations versionadas e reversíveis (4) | [migrations/](src/infrastructure/persistence/migrations) | [schema-constraints.test.ts](test/integration/schema-constraints.test.ts) ("são reversíveis") |
 | Endpoints e cursor estável e opaco (9) | controllers HTTP, [queries.ts](src/application/queries.ts) | [http-api.test.ts](test/integration/http-api.test.ts) (cursor estável com inserções entre páginas) |
 | Status HTTP distintos e consistentes (9) | `HttpErrorFilter` + status pelo resultado | [http-api.test.ts](test/integration/http-api.test.ts), [transient-failures.test.ts](test/integration/transient-failures.test.ts) (503 + Retry-After) |
@@ -316,7 +316,7 @@ Cada uma das garantias abaixo tem teste só com SQL em [schema-constraints.test.
 | Lançamento na moeda da wallet | FK `(wallet_id, currency) → wallets(id, currency)` |
 | Saldo = último lançamento (no COMMIT) | constraint trigger `DEFERRABLE INITIALLY DEFERRED` (`WL004`) |
 | `version` começa em 1 e sobe +1 só com o saldo | trigger `wallets_guard` (`WL003`) |
-| Wallet e transação nunca apagadas | triggers |
+| Wallet e transação nunca apagadas | triggers + ausência de DELETE nos GRANTs da app |
 | Estado terminal e campos de negócio imutáveis | trigger `wager_transactions_guard` (`WT001`) |
 | Referência na mesma wallet | FK `(reference_transaction_id, wallet_id) → wager_transactions(id, wallet_id)` |
 | Reversão única por referência | índice único parcial (decisão B) |
@@ -324,7 +324,34 @@ Cada uma das garantias abaixo tem teste só com SQL em [schema-constraints.test.
 | Dedup da inbox | `PRIMARY KEY (consumer_name, message_id)` |
 | Coerência de campos | `CHECK`s: referência exigida em REFUND/ROLLBACK e proibida em BET/OPENING; `failure_code` ⇔ REJECTED/FAILED; snapshot ⇔ PROCESSED/REJECTED |
 
-### 5.2 Transação e locks
+### 5.2 Privilégios: owner × aplicação (migration 008)
+Os triggers protegem contra bug; não protegem contra quem tem as credenciais do dono das tabelas, que
+pode desligá-los (`ALTER TABLE ... DISABLE TRIGGER`, `SET session_replication_role = replica`).
+Por isso há duas identidades:
+
+| Identidade | Variável | Uso | Privilégios |
+|---|---|---|---|
+| **owner** do schema | `MIGRATION_DATABASE_URL` | migrations; testes que contornam as garantias de propósito (divergência forçada na reconciliação, SQL puro do schema) | dono das tabelas (no compose de dev é o usuário de bootstrap, superuser) |
+| **aplicação** | `DATABASE_URL` | réplicas, consumer, workers, testes de comportamento | membro de `wagering_app_rw`: sem superuser, sem ownership, sem CREATE |
+
+`wagering_app_rw` (NOLOGIN, criado pela migration 008):
+- **ledger:** só `SELECT` e `INSERT`. Append-only também por privilégio.
+- **wallets, wager_transactions, inbox, outbox:** `SELECT`, `INSERT` e `UPDATE` **só das colunas mutáveis**
+  (saldo/versão; status, snapshot e agendamento; processamento da inbox; publicação da outbox). Identidade e
+  campos de negócio ficam fora do alcance da app, além dos triggers.
+- Nenhum `DELETE`, `TRUNCATE`, `TRIGGER` ou `REFERENCES`.
+
+O **login** da app (nome e senha de `DATABASE_URL`) é provisionado pelo [migrate.ts](src/infrastructure/persistence/migrate.ts)
+depois das migrations e herda o papel; a senha é configuração operacional e não fica em migration versionada.
+O migrate recusa um `DATABASE_URL` igual ao owner. Em produção o owner também não seria superuser
+(bastaria `CREATEROLE` para a 008); aqui ele é superuser só porque é o usuário de bootstrap da imagem do Postgres.
+O papel é do cluster: o down da 008 revoga os privilégios no database e só remove o papel se nenhum outro database
+ainda o usar. Tabela nova numa migration futura precisa de `GRANT` explícito.
+
+**Prova:** [db-privileges.test.ts](test/integration/db-privileges.test.ts), com a conexão da app:
+`UPDATE`/`DELETE`/`TRUNCATE`/`DISABLE TRIGGER` no ledger e `SET session_replication_role` → `42501`.
+
+### 5.3 Transação e locks
 - **Isolamento:** READ COMMITTED + `FOR NO KEY UPDATE` por wallet. A serialização vem do lock,
   não do isolamento. Com SERIALIZABLE, todo conflito em hot wallet viraria abort (`40001`) e retry caro,
   em vez de uma espera curta.

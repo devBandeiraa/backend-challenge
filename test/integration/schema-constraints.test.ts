@@ -6,14 +6,16 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { MikroORM } from '@mikro-orm/postgresql';
 import { buildOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { migrate } from '../../src/infrastructure/persistence/migrate';
-import { createTestOrm, TEST_DATABASE_URL } from '../support/db';
+import { createOwnerOrm, TEST_DATABASE_URL, TEST_OWNER_DATABASE_URL } from '../support/db';
 
 let orm: MikroORM;
 const uuid = () => crypto.randomUUID();
 const HASH = 'a'.repeat(64);
 
 beforeAll(async () => {
-  orm = await createTestOrm(5);
+  // Owner: aqui se testam as garantias do SCHEMA (triggers/constraints), que valem até para o dono das
+  // tabelas. Os privilégios da app, que barram antes, têm teste próprio (db-privileges.test.ts).
+  orm = await createOwnerOrm(5);
 });
 afterAll(async () => {
   await orm.close(true);
@@ -236,10 +238,10 @@ describe('migrations', () => {
   test('são reversíveis: up → down até zero → up, num database isolado', async () => {
     const dbName = `wagering_migrations_${Date.now()}`;
     await run(`CREATE DATABASE ${dbName}`);
-    const url = TEST_DATABASE_URL.replace(/\/[^/]+$/, `/${dbName}`);
+    const url = TEST_OWNER_DATABASE_URL.replace(/\/[^/]+$/, `/${dbName}`);
     try {
-      await migrate('up', url);
-      await migrate('reset', url); // down até 0 e up de novo
+      await migrate('up', url, TEST_DATABASE_URL);
+      await migrate('reset', url, TEST_DATABASE_URL); // down até 0 e up de novo
       const isolated = await MikroORM.init(buildOrmConfig({ clientUrl: url, poolMax: 1 }));
       try {
         const tables = await isolated.em.fork().execute<{ n: string }[]>(

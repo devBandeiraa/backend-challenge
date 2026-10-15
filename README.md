@@ -126,7 +126,8 @@ Lida na subida da instância; os defaults servem para rodar no host.
 
 | Variável | Padrão | Descrição |
 |---|---|---|
-| `DATABASE_URL` | `postgresql://wagering:wagering@localhost:5442/wagering` | Postgres |
+| `DATABASE_URL` | `postgresql://wagering_app:wagering_app@localhost:5442/wagering` | usuário da **aplicação**: sem superuser nem ownership; só `SELECT`/`INSERT` no ledger ([ARCHITECTURE.md §5.2](ARCHITECTURE.md#52-privilégios-owner--aplicação-migration-008)) |
+| `MIGRATION_DATABASE_URL` | `postgresql://wagering:wagering@localhost:5442/wagering` | **owner** do schema, usado só pelas migrations; o `migrate` também provisiona o login da app a partir de `DATABASE_URL` |
 | `DB_POOL_MAX` | 10 | conexões por instância |
 | `DB_LOCK_TIMEOUT_MS` | 5000 | teto de espera por lock em cada transação |
 | `UOW_MAX_ATTEMPTS` | 5 | tentativas da transação em conflito de concorrência |

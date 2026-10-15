@@ -7,21 +7,25 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { assertLedgerInvariant, walletBalance } from '../support/app-context';
-import { createTestOrm } from '../support/db';
+import { createOwnerOrm, createTestOrm } from '../support/db';
 import { http, parseLogLines, startHttpApp } from '../support/http-app';
 
 let baseUrl: string;
 let close: () => Promise<void>;
 let orm: MikroORM;
+/** Conexão do OWNER: só ele (superuser no compose de dev) consegue contornar triggers; a app não. */
+let ownerOrm: MikroORM;
 const logLines: string[] = [];
 
 beforeAll(async () => {
   ({ baseUrl, close } = await startHttpApp({ logLines }));
   orm = await createTestOrm(3);
+  ownerOrm = await createOwnerOrm(2);
 });
 afterAll(async () => {
   await close();
   await orm.close(true);
+  await ownerOrm.close(true);
 });
 
 async function wallet(amount: string) {
@@ -37,9 +41,9 @@ async function bet(w: { id: string; playerId: string }, amount: string) {
   });
 }
 
-/** Escrita que contorna a aplicação E os triggers (exige superusuário, como no compose de dev). */
+/** Escrita que contorna a aplicação E os triggers: exige a conexão do owner (superuser no compose de dev). */
 async function corrupt(sql: string, params: unknown[]) {
-  await orm.em.fork().transactional(async (em) => {
+  await ownerOrm.em.fork().transactional(async (em) => {
     await em.execute(`SET LOCAL session_replication_role = replica`);
     await em.execute(sql, params);
   });

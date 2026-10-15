@@ -1,11 +1,12 @@
 import { defineConfig } from '@mikro-orm/postgresql';
 import { Migrator } from '@mikro-orm/migrations';
+import { appDatabaseUrl } from './database-urls';
 import { migrationsList } from './migrations';
 import { entities } from './schemas';
 
 export function buildOrmConfig(overrides: { clientUrl?: string; poolMax?: number } = {}) {
   return defineConfig({
-    clientUrl: overrides.clientUrl ?? process.env.DATABASE_URL ?? 'postgresql://wagering:wagering@localhost:5442/wagering',
+    clientUrl: overrides.clientUrl ?? appDatabaseUrl(),
     entities,
     extensions: [Migrator],
     pool: { min: 0, max: overrides.poolMax ?? Number(process.env.DB_POOL_MAX ?? 10) },

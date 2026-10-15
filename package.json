@@ -18,7 +18,7 @@
     "test:multi": "bun run scripts/test-multi.ts",
     "test:all": "bun run test && bun run test:multi",
     "test:load": "bun run scripts/load-test.ts",
-    "infra:up": "docker compose up -d --wait postgres localstack && docker compose run --rm migrate && docker compose run --rm sqs-init",
+    "infra:up": "docker compose up -d --wait postgres localstack && docker compose run --rm --build migrate && docker compose run --rm --build sqs-init",
     "stack:up": "docker compose up -d --build --wait",
     "queues:provision": "bun run src/infrastructure/messaging/sqs/provision-queues.ts",
     "infra:down": "docker compose down -v"

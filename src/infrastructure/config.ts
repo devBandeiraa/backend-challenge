@@ -1,4 +1,5 @@
 import { hostname } from 'node:os';
+import { appDatabaseUrl } from './persistence/database-urls';
 
 /** Papéis que uma instância executa. Padrão: todos, então 3 réplicas = 3 consumers + 3 workers concorrentes. */
 export type AppRole = 'http' | 'consumer' | 'outbox' | 'pending-reference';
@@ -48,7 +49,8 @@ export function loadConfig(): AppConfig {
     port: num('PORT', 3000),
     roles: new Set(roles),
     db: {
-      url: process.env.DATABASE_URL ?? 'postgresql://wagering:wagering@localhost:5442/wagering',
+      // Usuário da aplicação (sem superuser/ownership); migrations usam MIGRATION_DATABASE_URL.
+      url: appDatabaseUrl(),
       poolMax: num('DB_POOL_MAX', 10),
       lockTimeoutMs: num('DB_LOCK_TIMEOUT_MS', 5_000),
       uowMaxAttempts: num('UOW_MAX_ATTEMPTS', 5),

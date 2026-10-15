@@ -11,7 +11,8 @@ x-sqs-healthcheck: &sqs-healthcheck
   retries: 60
 
 x-app-env: &app-env
-  DATABASE_URL: postgresql://wagering:wagering@postgres:5432/wagering
+  # Usuário da APLICAÇÃO: sem superuser e sem ownership (GRANTs da migration 008).
+  DATABASE_URL: postgresql://wagering_app:wagering_app@postgres:5432/wagering
   SQS_ENDPOINT: http://sqs:4566
   AWS_REGION: us-east-1
   AWS_ACCESS_KEY_ID: test
@@ -69,7 +70,10 @@ services:
   migrate:
     build: { context: ., dockerfile: docker/app.Dockerfile }
     command: ["bun", "run", "src/infrastructure/persistence/migrate.ts", "up"]
-    environment: *app-env
+    environment:
+      <<: *app-env
+      # Migrations rodam com o OWNER do schema e provisionam o login da app a partir de DATABASE_URL.
+      MIGRATION_DATABASE_URL: postgresql://wagering:wagering@postgres:5432/wagering
     depends_on:
       postgres: { condition: service_healthy }
     restart: "no"
