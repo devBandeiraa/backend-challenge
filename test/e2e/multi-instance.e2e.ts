@@ -28,14 +28,31 @@ afterAll(async () => {
   await orm?.close(true);
 });
 
+/**
+ * Pelo host, o proxy de portas do Docker Desktop (Windows) derruba ~0,4% das conexões com
+ * ECONNRESET aos 30s sem que a requisição chegue ao nginx (docs/load-test-analysis.md).
+ * Requisições COM Idempotency-Key são reenviadas, como faria um provedor real: é exatamente o
+ * caso de uso da key, e as asserções de "um único débito" continuam valendo.
+ */
+let transportRetries = 0;
 async function post(path: string, body: unknown, headers: Record<string, string> = {}) {
-  const res = await fetch(`${BASE_URL}${path}`, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', ...headers },
-    body: JSON.stringify(body),
-  });
-  return { status: res.status, instance: res.headers.get('x-instance-id'), body: (await res.json()) as any };
+  for (let attempt = 1; ; attempt++) {
+    try {
+      const res = await fetch(`${BASE_URL}${path}`, {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', ...headers },
+        body: JSON.stringify(body),
+      });
+      return { status: res.status, instance: res.headers.get('x-instance-id'), body: (await res.json()) as any };
+    } catch (error) {
+      if (!headers['idempotency-key'] || attempt >= 3 || (error as { code?: string }).code !== 'ECONNRESET') throw error;
+      transportRetries += 1;
+    }
+  }
 }
+afterAll(() => {
+  if (transportRetries > 0) console.log(JSON.stringify({ transportRetriesWithSameIdempotencyKey: transportRetries }));
+});
 
 async function createWallet(amount: string) {
   const res = await post('/wallets', { playerId: crypto.randomUUID(), initialBalance: { amount, currency: 'BRL' } });
