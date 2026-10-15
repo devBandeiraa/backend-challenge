@@ -10,7 +10,7 @@ import type { PendingReferencePolicy } from './application/wagering/settle-trans
 import { OpenWalletUseCase } from './application/wallets/open-wallet';
 import { ReconcileWalletUseCase } from './application/wallets/reconcile-wallet';
 import { ExponentialBackoff } from './domain/messaging/backoff-policy';
-import { APP_CONFIG, type AppConfig, assertConsumerTiming, loadConfig } from './infrastructure/config';
+import { APP_CONFIG, type AppConfig, assertConsumerTiming, loadConfig, maxMessageProcessingMs } from './infrastructure/config';
 import { createSqsClient } from './infrastructure/messaging/sqs/sqs-config';
 import { SQS_GATEWAY, SqsGateway } from './infrastructure/messaging/sqs/sqs-gateway';
 import { createLogger, type Logger, PinoNestLogger } from './infrastructure/observability/logger';
@@ -109,6 +109,7 @@ const messaging = [
             visibilityTimeoutSeconds: config.sqs.visibilityTimeoutSeconds,
             batchSize: config.sqs.batchSize,
             shutdownGraceMs: config.sqs.shutdownGraceMs,
+            maxProcessingMs: maxMessageProcessingMs(config.db),
           })
         : undefined;
 
@@ -116,6 +117,7 @@ const messaging = [
       if (config.roles.has('outbox')) {
         const publisher = new OutboxPublisher(orm, gateway, metrics, logger.child({ component: 'outbox' }), {
           batchSize: config.outbox.batchSize,
+          statementTimeoutMs: config.db.statementTimeoutMs,
         });
         let lastLagRefresh = 0;
         workers.push(
@@ -194,7 +196,7 @@ const messaging = [
       useFactory: (orm: MikroORM, config: AppConfig, metrics: AppMetrics, logger: Logger) =>
         new MikroOrmUnitOfWork(
           orm,
-          { maxAttempts: config.db.uowMaxAttempts, lockTimeoutMs: config.db.lockTimeoutMs },
+          { maxAttempts: config.db.uowMaxAttempts, lockTimeoutMs: config.db.lockTimeoutMs, statementTimeoutMs: config.db.statementTimeoutMs },
           {
             onRetry: ({ attempt, sqlState, constraint }) => {
               metrics.lockConflicts.inc({ sqlstate: sqlState ?? 'unknown' });

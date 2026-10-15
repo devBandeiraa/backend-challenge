@@ -31,6 +31,12 @@ export interface ConsumerOptions {
   batchSize: number;
   /** Prazo para concluir mensagens em andamento no shutdown. */
   shutdownGraceMs: number;
+  /**
+   * Teto do heartbeat (pior caso × fator, ver config.ts). Depois dele a visibilidade deixa de ser
+   * renovada e a mensagem volta à fila: uma entrega travada não segura o grupo FIFO para sempre.
+   * A redelivery concorrente é segura (inbox + idempotency key). Sem valor: sem teto.
+   */
+  maxProcessingMs?: number;
   retryBackoff?: ExponentialBackoff;
   /** Ponto de injeção de falha para testes de crash (ex.: matar o processo após commit, antes do ack). */
   hooks?: { afterCommit?(message: ReceivedMessage, outcome: MessageOutcome): Promise<void> | void };
@@ -243,14 +249,26 @@ export class WagerTransactionConsumer {
    * a mensagem reapareceria para outro consumer no meio do processamento. A inbox e a idempotency
    * key tornariam isso seguro, mas gastariam um recebimento do limite e um retry à toa.
    * Se o processo morrer, o heartbeat morre junto e a visibilidade expira normalmente.
+   * Teto de renovações (maxProcessingMs): uma instrução travada além do pior caso não prende a
+   * mensagem indefinidamente; ela volta à fila e outra entrega deduplica pela inbox.
    */
   private startHeartbeat(message: ReceivedMessage, log: Logger): () => void {
     const visibility = this.options.visibilityTimeoutSeconds;
+    const intervalMs = Math.max(1_000, Math.floor((visibility * 1_000) / 3));
+    const maxRenewals =
+      this.options.maxProcessingMs === undefined ? Number.POSITIVE_INFINITY : Math.ceil(this.options.maxProcessingMs / intervalMs);
+    let renewals = 0;
     const timer = setInterval(() => {
+      if (renewals >= maxRenewals) {
+        clearInterval(timer);
+        log.warn({ msg: 'visibility heartbeat cap reached; message will become visible again', renewals, maxProcessingMs: this.options.maxProcessingMs });
+        return;
+      }
+      renewals += 1;
       this.gateway.changeVisibility(message, visibility).catch((error) => {
         log.warn({ msg: 'visibility heartbeat failed', err: error });
       });
-    }, Math.max(1_000, Math.floor((visibility * 1_000) / 3)));
+    }, intervalMs);
     return () => clearInterval(timer);
   }
 

@@ -9,7 +9,7 @@ export interface AppConfig {
   instanceId: string;
   port: number;
   roles: Set<AppRole>;
-  db: { url: string; poolMax: number; lockTimeoutMs: number; uowMaxAttempts: number };
+  db: { url: string; poolMax: number; lockTimeoutMs: number; statementTimeoutMs: number; uowMaxAttempts: number };
   sqs: {
     endpoint: string;
     inputQueue: string;
@@ -44,6 +44,14 @@ export function loadConfig(): AppConfig {
     .filter(Boolean) as AppRole[];
   for (const r of roles) if (!ALL_ROLES.includes(r)) throw new Error(`unknown APP_ROLES entry: ${r}`);
 
+  const lockTimeoutMs = num('DB_LOCK_TIMEOUT_MS', 5_000);
+  const statementTimeoutMs = num('DB_STATEMENT_TIMEOUT_MS', 8_000);
+  // Espera de lock precisa terminar por lock_timeout (55P03, refeito pela unit of work), não por
+  // statement_timeout (57014, tratado como indisponibilidade e não refeito na mesma entrega).
+  if (statementTimeoutMs <= lockTimeoutMs) {
+    throw new Error(`DB_STATEMENT_TIMEOUT_MS (${statementTimeoutMs}) must be greater than DB_LOCK_TIMEOUT_MS (${lockTimeoutMs})`);
+  }
+
   return {
     instanceId: process.env.INSTANCE_ID ?? hostname(),
     port: num('PORT', 3000),
@@ -52,7 +60,10 @@ export function loadConfig(): AppConfig {
       // Usuário da aplicação (sem superuser/ownership); migrations usam MIGRATION_DATABASE_URL.
       url: appDatabaseUrl(),
       poolMax: num('DB_POOL_MAX', 10),
-      lockTimeoutMs: num('DB_LOCK_TIMEOUT_MS', 5_000),
+      lockTimeoutMs,
+      // Teto de qualquer instrução (query travada, rede meio-aberta): sem ele, o heartbeat do consumer
+      // seguraria a mensagem (e o grupo FIFO da wallet) indefinidamente.
+      statementTimeoutMs,
       uowMaxAttempts: num('UOW_MAX_ATTEMPTS', 5),
     },
     sqs: {
@@ -83,16 +94,28 @@ export function loadConfig(): AppConfig {
 const UOW_BACKOFF = { baseMs: 10, factor: 2, maxMs: 200 };
 
 /**
- * Pior caso de processamento de UMA mensagem: cada tentativa da unit of work pode esperar até
- * lock_timeout, mais o backoff entre tentativas, mais a gravação do FAILED (que pode esperar
- * mais um lock_timeout num índice único). O tempo de execução de SQL em si (ms) é desprezível.
+ * Pior caso de processamento de UMA entrega, o maior de dois caminhos:
+ *  (a) lock: toda tentativa da unit of work para no lock_timeout (55P03, refeita) e a gravação do
+ *      FAILED espera mais um lock_timeout: (tentativas + 1) × lock_timeout + backoff;
+ *  (b) instrução lenta: as tentativas anteriores param no lock e uma instrução estoura o
+ *      statement_timeout (57014, NÃO refeita na mesma entrega); a gravação do FAILED também é
+ *      limitada por ele: (tentativas − 1) × lock_timeout + 2 × statement_timeout + backoff.
+ * Cada tentativa é dominada por UMA espera longa; o tempo das demais instruções (ms) é desprezível.
+ * O mesmo valor (× fator) é o teto de renovações do heartbeat do consumer.
  */
-export function worstCaseMessageProcessingMs(db: AppConfig['db']): number {
-  let total = (db.uowMaxAttempts + 1) * db.lockTimeoutMs;
+export function worstCaseMessageProcessingMs(db: Pick<AppConfig['db'], 'uowMaxAttempts' | 'lockTimeoutMs' | 'statementTimeoutMs'>): number {
+  let backoff = 0;
   for (let n = 1; n < db.uowMaxAttempts; n++) {
-    total += Math.min(UOW_BACKOFF.maxMs, UOW_BACKOFF.baseMs * UOW_BACKOFF.factor ** (n - 1));
+    backoff += Math.min(UOW_BACKOFF.maxMs, UOW_BACKOFF.baseMs * UOW_BACKOFF.factor ** (n - 1));
   }
-  return total;
+  const lockPath = (db.uowMaxAttempts + 1) * db.lockTimeoutMs + backoff;
+  const statementPath = (db.uowMaxAttempts - 1) * db.lockTimeoutMs + 2 * db.statementTimeoutMs + backoff;
+  return Math.max(lockPath, statementPath);
+}
+
+/** Teto do heartbeat: depois dele a visibilidade expira e a mensagem volta (inbox e key tornam isso seguro). */
+export function maxMessageProcessingMs(db: Pick<AppConfig['db'], 'uowMaxAttempts' | 'lockTimeoutMs' | 'statementTimeoutMs'>): number {
+  return Math.ceil(worstCaseMessageProcessingMs(db) * VISIBILITY_SAFETY_FACTOR);
 }
 
 export const VISIBILITY_SAFETY_FACTOR = 1.5;
@@ -107,7 +130,8 @@ export function assertConsumerTiming(config: Pick<AppConfig, 'db' | 'sqs'>): voi
     throw new Error(
       `SQS_VISIBILITY_TIMEOUT_SECONDS=${config.sqs.visibilityTimeoutSeconds} is below ${VISIBILITY_SAFETY_FACTOR}× the worst-case ` +
         `processing time (${worstCaseMessageProcessingMs(config.db)} ms from UOW_MAX_ATTEMPTS=${config.db.uowMaxAttempts}, ` +
-        `DB_LOCK_TIMEOUT_MS=${config.db.lockTimeoutMs}); need at least ${Math.ceil(requiredMs / 1_000)} s`,
+        `DB_LOCK_TIMEOUT_MS=${config.db.lockTimeoutMs}, DB_STATEMENT_TIMEOUT_MS=${config.db.statementTimeoutMs}); ` +
+        `need at least ${Math.ceil(requiredMs / 1_000)} s`,
     );
   }
 }

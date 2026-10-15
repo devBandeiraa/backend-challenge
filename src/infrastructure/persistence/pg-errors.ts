@@ -26,6 +26,7 @@ const UNAVAILABLE_SQLSTATES = new Set([
   '57P02', // crash_shutdown
   '57P03', // cannot_connect_now
   '53300', // too_many_connections
+  '57014', // query_canceled: statement_timeout (instrução lenta/travada); não é refeita na mesma entrega
 ]);
 const UNAVAILABLE_NODE_CODES = new Set(['ECONNREFUSED', 'ECONNRESET', 'ETIMEDOUT', 'EPIPE', 'ENOTFOUND', 'EAI_AGAIN']);
 

@@ -8,6 +8,8 @@ import { OutboxRecord } from '../persistence/schemas';
 
 export interface OutboxPublisherOptions {
   batchSize: number;
+  /** Teto de cada instrução da transação de publicação (SET LOCAL statement_timeout). */
+  statementTimeoutMs?: number;
   /** Injeção de falha para testes: chamado após o SendMessage e ANTES do commit. */
   hooks?: { afterSend?(eventIds: string[]): Promise<void> | void };
 }
@@ -34,6 +36,7 @@ export class OutboxPublisher {
   async publishOnce(): Promise<{ published: number; failed: number }> {
     return this.orm.em.fork().transactional(
       async (em) => {
+        await em.execute(`SET LOCAL statement_timeout = ${Math.floor(this.options.statementTimeoutMs ?? 8_000)}`);
         const now = new Date();
         const rows = await em.find(
           OutboxRecord,

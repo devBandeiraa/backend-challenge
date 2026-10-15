@@ -448,9 +448,18 @@ ainda o usar. Tabela nova numa migration futura precisa de `GRANT` explícito.
   (a mensagem foi recebida 2×).
 - **Validação no startup** ([config.ts](src/infrastructure/config.ts)): a instância **não sobe** se
   `visibilityTimeout < 1,5 × pior caso`.
-  - Pior caso = (tentativas da unit of work + 1 da gravação do FAILED) × `lock_timeout` + backoff entre tentativas.
-  - Com os defaults, isso dá (5+1) × 5 s + 150 ms = 30,15 s, o que exige ≥ 46 s. Por isso o padrão é **60 s**.
-  - O heartbeat cobre lentidões fora do previsto; a validação garante a folga mesmo que um heartbeat falhe.
+  - **`statement_timeout` por transação** (`SET LOCAL`, padrão 8 s, sempre maior que `lock_timeout`; a instância não
+    sobe se não for): espera de lock termina em `55P03` e é refeita; uma instrução travada (query lenta, rede
+    meio-aberta) termina em `57014`, tratada como indisponibilidade (503 / retry SQS) e **não** refeita na mesma
+    entrega. Vale também para a transação do publisher da outbox.
+  - Pior caso = o maior de dois caminhos, mais o backoff entre tentativas:
+    - lock: (tentativas + 1 da gravação do FAILED) × `lock_timeout`;
+    - instrução lenta: (tentativas − 1) × `lock_timeout` + 2 × `statement_timeout` (a que estoura e a do FAILED).
+  - Com os defaults: max(6 × 5 s, 4 × 5 s + 2 × 8 s) + 150 ms = 36,15 s, o que exige ≥ 55 s. Por isso o padrão é **60 s**.
+  - **Teto do heartbeat:** o heartbeat renova a visibilidade só até 1,5 × pior caso (cerca de 54 s). Depois disso a
+    mensagem volta à fila em vez de segurar o grupo FIFO da wallet para sempre; a nova entrega é deduplicada pela
+    inbox. Prova: "teto do heartbeat" em [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts) e
+    "statement_timeout" em [transient-failures.test.ts](test/integration/transient-failures.test.ts).
 - **Provisionamento convergente:** `CreateQueue` só com os atributos imutáveis da FIFO, depois
   `SetQueueAttributes` com visibilidade e redrive. Mudar a configuração ajusta filas já existentes.
 

@@ -5,6 +5,9 @@
  */
 import { afterAll, beforeAll, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
+import { TransientInfrastructureError } from '../../src/application/errors';
+import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm-unit-of-work';
+import { sqlStateOf } from '../../src/infrastructure/persistence/pg-errors';
 import { assertLedgerInvariant } from '../support/app-context';
 import { createTestOrm } from '../support/db';
 import { http, startHttpApp } from '../support/http-app';
@@ -73,4 +76,27 @@ test('lock segurado além do lock_timeout → retries medidos → 503 com Retry-
   expect(retry.status).toBe(200);
   expect(retry.body).toMatchObject({ status: 'PROCESSED', balance: { amount: '90.00' }, idempotentReplay: false });
   await assertLedgerInvariant(orm, wallet.id);
+});
+
+/** EntityManager da transação corrente (os repositórios o guardam): só para executar SQL arbitrário no teste. */
+const emOf = (scope: unknown) => (scope as { wallets: { em: { execute(sql: string): Promise<Record<string, string>[]> } } }).wallets.em;
+
+test('statement_timeout: instrução travada é cancelada (57014) e vira falha transitória, sem retry na mesma entrega', async () => {
+  let retries = 0;
+  const uow = new MikroOrmUnitOfWork(orm, { maxAttempts: 3, lockTimeoutMs: 100, statementTimeoutMs: 300 }, { onRetry: () => void retries++ });
+  const seen: string[] = [];
+  const startedAt = performance.now();
+  const error = await uow
+    .run(async (scope) => {
+      seen.push((await emOf(scope).execute('SHOW statement_timeout'))[0]!.statement_timeout!);
+      await emOf(scope).execute('SELECT pg_sleep(2)');
+    })
+    .catch((e: unknown) => e);
+  const elapsed = performance.now() - startedAt;
+
+  expect(seen).toEqual(['300ms']); // SET LOCAL aplicado na própria transação da unit of work
+  expect(error).toBeInstanceOf(TransientInfrastructureError);
+  expect(sqlStateOf((error as TransientInfrastructureError).cause)).toBe('57014');
+  expect(retries).toBe(0); // 57014 não é refeito: não multiplica o pior caso
+  expect(elapsed).toBeLessThan(1_500);
 });

@@ -130,6 +130,7 @@ Lida na subida da instância; os defaults servem para rodar no host.
 | `MIGRATION_DATABASE_URL` | `postgresql://wagering:wagering@localhost:5442/wagering` | **owner** do schema, usado só pelas migrations; o `migrate` também provisiona o login da app a partir de `DATABASE_URL` |
 | `DB_POOL_MAX` | 10 | conexões por instância |
 | `DB_LOCK_TIMEOUT_MS` | 5000 | teto de espera por lock em cada transação |
+| `DB_STATEMENT_TIMEOUT_MS` | 8000 | teto de cada instrução SQL; precisa ser maior que `DB_LOCK_TIMEOUT_MS` (**a instância não sobe** se não for) |
 | `UOW_MAX_ATTEMPTS` | 5 | tentativas da transação em conflito de concorrência |
 | `APP_ROLES` | `http,consumer,outbox,pending-reference` | papéis desta instância |
 | `SQS_ENDPOINT` | `http://localhost:4566` | emulador SQS |

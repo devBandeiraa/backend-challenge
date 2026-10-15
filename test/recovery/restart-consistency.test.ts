@@ -29,8 +29,9 @@ function startService(): Subprocess {
       SQS_DLQ: names.deadLetter,
       SQS_EVENTS_QUEUE: names.events,
       SQS_WAIT_TIME_SECONDS: '1',
-      // timing coerente com a validação de startup: (3+1)×1s + backoff ≈ 4s × 1,5 < 7s
+      // timing coerente com a validação de startup: max((3+1)×1s, 2×1s + 2×1,2s) + backoff ≈ 4,4s × 1,5 < 7s
       DB_LOCK_TIMEOUT_MS: '1000',
+      DB_STATEMENT_TIMEOUT_MS: '1200',
       UOW_MAX_ATTEMPTS: '3',
       SQS_VISIBILITY_TIMEOUT_SECONDS: '7',
       OUTBOX_INTERVAL_MS: '100',
@@ -133,7 +134,23 @@ test('kill -9 no meio da carga → restart → reenvio com as mesmas keys → co
   await waitReady();
 
   // O provedor reenvia TUDO com as mesmas keys: o que já tinha sido confirmado vira replay.
-  const secondPass = await Promise.all(httpBets.map(submit));
+  // Como um provedor real, reenvia também em erro de rede (300 conexões simultâneas contra um processo
+  // recém-iniciado podem estourar o backlog de conexões do loopback no Windows). A mesma key torna o
+  // reenvio seguro; o processo continuar vivo prova que não foi crash.
+  let networkResends = 0;
+  const resubmit = async (b: (typeof httpBets)[number]) => {
+    for (let attempt = 1; ; attempt++) {
+      try {
+        return await submit(b);
+      } catch (error) {
+        if (attempt >= 10) throw error;
+        networkResends++;
+        await Bun.sleep(100 * attempt);
+      }
+    }
+  };
+  const secondPass = await Promise.all(httpBets.map(resubmit));
+  expect(proc!.exitCode).toBeNull();
   expect(secondPass.every((r) => r.status === 200)).toBe(true);
   const replays = secondPass.filter((r) => r.body.idempotentReplay).length;
   const answered = firstPass.filter((r) => r.status === 200).length;
@@ -174,5 +191,5 @@ test('kill -9 no meio da carga → restart → reenvio com as mesmas keys → co
     return pending === 0 || undefined;
   }, 90_000, 500);
 
-  console.log(JSON.stringify({ restartTest: { httpRequests: httpBets.length, answeredBeforeKill: answered, lostOnKill: lost, replaysAfterRestart: replays, committedButResponseLost } }));
+  console.log(JSON.stringify({ restartTest: { httpRequests: httpBets.length, answeredBeforeKill: answered, lostOnKill: lost, replaysAfterRestart: replays, committedButResponseLost, networkResends } }));
 }, 240_000);

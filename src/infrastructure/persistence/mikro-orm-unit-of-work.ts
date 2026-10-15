@@ -20,6 +20,12 @@ export interface UnitOfWorkOptions {
    * vira 55P03 → retry com backoff → 503/retry SQS: degradação explícita e mensurável.
    */
   lockTimeoutMs?: number;
+  /**
+   * Teto de cada instrução (SET LOCAL statement_timeout). Maior que lock_timeout: espera de lock
+   * termina em 55P03 (refeita); só uma instrução lenta de verdade termina em 57014, tratada como
+   * indisponibilidade (503 / retry SQS) e não refeita aqui, para não multiplicar o pior caso.
+   */
+  statementTimeoutMs?: number;
 }
 
 /**
@@ -31,6 +37,7 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
   private readonly backoff = new ExponentialBackoff({ baseMs: 10, factor: 2, maxMs: 200, jitterRatio: 0.5 });
   private readonly maxAttempts: number;
   private readonly lockTimeoutMs: number;
+  private readonly statementTimeoutMs: number;
 
   constructor(
     private readonly orm: MikroORM,
@@ -39,6 +46,7 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
   ) {
     this.maxAttempts = options.maxAttempts ?? 5;
     this.lockTimeoutMs = Math.max(1, Math.floor(options.lockTimeoutMs ?? 5_000));
+    this.statementTimeoutMs = Math.max(this.lockTimeoutMs + 1, Math.floor(options.statementTimeoutMs ?? 8_000));
   }
 
   async run<T>(work: (scope: TransactionScope) => Promise<T>): Promise<T> {
@@ -49,6 +57,7 @@ export class MikroOrmUnitOfWork implements UnitOfWork {
         return await em.transactional(
           async (tem) => {
             await tem.execute(`SET LOCAL lock_timeout = ${this.lockTimeoutMs}`);
+            await tem.execute(`SET LOCAL statement_timeout = ${this.statementTimeoutMs}`);
             return work(createTransactionScope(tem));
           },
           { isolationLevel: IsolationLevel.READ_COMMITTED },

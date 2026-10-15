@@ -391,3 +391,51 @@ describe('shutdown (SIGTERM)', () => {
     await slowApp.close();
   }, 30_000);
 });
+
+describe('teto do heartbeat (maxProcessingMs)', () => {
+  test('entrega travada além do teto: a visibilidade deixa de ser renovada, outro consumer recebe e a inbox evita o 2º efeito', async () => {
+    const w = await wallet('100.00');
+    const cmd = wagerCommand(w, { money: { amount: '10.00', currency: 'BRL' } });
+    // lock_timeout longo: as duas entregas esperam (wallet e PK da inbox) em vez de desistir
+    const slowApp = await createAppContext({ poolMax: 4, uow: { maxAttempts: 1, lockTimeoutMs: 20_000 } });
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    let locked!: () => void;
+    const isLocked = new Promise<void>((r) => (locked = r));
+    const holder = app.orm.em.fork().transactional(async (em) => {
+      await em.execute(`SELECT id FROM wallets WHERE id = ? FOR NO KEY UPDATE`, [w.id]);
+      locked();
+      await released;
+    });
+    await isLocked;
+
+    await send(wagerMessage(messageData(cmd)).body, w.id);
+    const options = {
+      consumerName: 'test-consumer',
+      maxAttempts: 3,
+      waitTimeSeconds: 1,
+      visibilityTimeoutSeconds: 2,
+      batchSize: 10,
+      shutdownGraceMs: 20_000,
+      maxProcessingMs: 3_000, // renova por ~3 s e para: a mensagem reaparece ~2 s depois
+    };
+    const metricsA = new AppMetrics();
+    const metricsB = new AppMetrics();
+    const a = new WagerTransactionConsumer(gateway, slowApp.processTransaction, metricsA, logger, options);
+    a.start();
+    await Bun.sleep(1_000);
+    const b = new WagerTransactionConsumer(gateway, slowApp.processTransaction, metricsB, logger, options);
+    b.start();
+    // B só recebe depois do teto (sem teto, o teste anterior prova que nunca receberia)
+    await waitFor(async () => (await countRows(app.orm, `pg_stat_activity WHERE wait_event_type = 'Lock' AND query ILIKE '%inbox_messages%'`, [])) >= 1 || undefined, 15_000, 200);
+    release();
+    await holder;
+    await waitFor(async () => (await metricsB.sqsMessages.get()).values.some((v) => v.labels.outcome === 'duplicate') || undefined, 15_000);
+    await Promise.all([a.stop(), b.stop()]);
+    await slowApp.close();
+
+    expect((await metricsA.sqsMessages.get()).values.find((v) => v.labels.outcome === 'processed')?.value).toBe(1);
+    expect(await walletBalance(app.orm, w.id)).toBe('90.00');
+    expect(await countRows(app.orm, `wallet_ledger_entries l JOIN wager_transactions t ON t.id = l.transaction_id WHERE t.idempotency_key = ?`, [cmd.idempotencyKey])).toBe(1);
+  }, 45_000);
+});
