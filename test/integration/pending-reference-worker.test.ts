@@ -123,6 +123,38 @@ describe('referência nunca chega', () => {
   });
 });
 
+describe('linha venenosa', () => {
+  test('erro NÃO transitório ao resolver: vira FAILED/PROCESSING_FAILED (não é reivindicada em loop)', async () => {
+    const w = await wallet('100.00');
+    const out = await app.processTransaction.execute(wagerCommand(w, { kind: 'REFUND', referenceExternalTransactionId: `poison-${crypto.randomUUID()}` }));
+    await Bun.sleep(100);
+
+    // Injeção de falha de PROGRAMAÇÃO (não de infraestrutura) sobre o banco real: a leitura da
+    // referência desta transação lança TypeError. Todo o resto é Postgres de verdade.
+    const { ResolvePendingReferencesUseCase } = await import('../../src/application/wagering/resolve-pending-references');
+    const { SystemClock, UuidV7Generator } = await import('../../src/infrastructure/system');
+    const faultyUow = {
+      run: <T>(work: (scope: any) => Promise<T>) =>
+        app.uow.run((scope) =>
+          work({
+            ...scope,
+            transactions: Object.assign(Object.create(scope.transactions), {
+              findByExternalId: async (providerId: string, ext: string) => {
+                if (ext.startsWith('poison-')) throw new TypeError('unexpected shape');
+                return scope.transactions.findByExternalId(providerId, ext);
+              },
+            }),
+          }),
+        ),
+    };
+    const worker = new ResolvePendingReferencesUseCase(faultyUow, new SystemClock(), new UuidV7Generator());
+    for (let i = 0; i < 20 && (await status(out.transactionId)).status === 'PENDING_REFERENCE'; i++) await worker.runOnce(50);
+
+    expect(await status(out.transactionId)).toMatchObject({ status: 'FAILED', failure_code: 'PROCESSING_FAILED' });
+    expect(await walletBalance(app.orm, w.id)).toBe('100.00');
+  });
+});
+
 describe('workers concorrentes', () => {
   test('duas instâncias (pools próprios) resolvendo as mesmas pendências: cada uma processada exatamente uma vez', async () => {
     const w = await wallet('1000.00');
