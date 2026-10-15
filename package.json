@@ -14,6 +14,7 @@
     "test:unit": "bun test test/unit",
     "test:integration": "bun test --timeout 60000 test/integration",
     "test:concurrency": "bun test --timeout 60000 test/concurrency",
+    "test:recovery": "bun test --timeout 60000 test/recovery",
     "test:multi": "bun run scripts/test-multi.ts",
     "test:all": "bun run test && bun run test:multi",
     "infra:up": "docker compose up -d postgres localstack migrate sqs-init",
