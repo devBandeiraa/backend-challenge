@@ -140,7 +140,7 @@ Lida na subida da instância; os defaults servem para rodar no host.
 | `SQS_CONSUMER_MAX_ATTEMPTS` | 5 | recebimentos até FAILED + DLQ |
 | `SQS_VISIBILITY_TIMEOUT_SECONDS` | 90 | precisa ser ≥ 1,5 × pior caso de processamento; **a instância não sobe** se for menor |
 | `SQS_WAIT_TIME_SECONDS` / `SQS_BATCH_SIZE` | 10 / 10 | long polling e tamanho do lote |
-| `SHUTDOWN_GRACE_MS` | 10000 (20000 no compose) | prazo para concluir mensagens em andamento no SIGTERM |
+| `SHUTDOWN_GRACE_MS` | long poll + pior caso (60000 no compose) | prazo para concluir mensagens em andamento no SIGTERM; precisa ser ≥ `SQS_WAIT_TIME_SECONDS` + pior caso de processamento (**a instância não sobe** se for menor). O `stop_grace_period` do compose (75 s) fica acima dele |
 | `OUTBOX_BATCH_SIZE` / `OUTBOX_INTERVAL_MS` | 100 / 200 | publisher da outbox |
 | `PENDING_REFERENCE_MAX_ATTEMPTS` | 10 | tentativas até `REFERENCE_NOT_FOUND` |
 | `PENDING_REFERENCE_BASE_DELAY_MS` / `_MAX_DELAY_MS` | 500 / 30000 | backoff do worker |

@@ -408,6 +408,50 @@ describe('shutdown (SIGTERM)', () => {
   }, 30_000);
 });
 
+describe('SIGTERM durante um long poll', () => {
+  test('o poll em andamento NÃO é abortado: o que ele recebe é devolvido na hora e outro consumer processa em segundos', async () => {
+    const wallets = await Promise.all([1, 2, 3].map(() => wallet('100.00')));
+    const cmds = wallets.map((w) => wagerCommand(w, { money: { amount: '5.00', currency: 'BRL' } }));
+    const options = {
+      consumerName: 'test-consumer',
+      maxAttempts: 3,
+      waitTimeSeconds: 5, // long poll longo: o SIGTERM chega no meio dele
+      visibilityTimeoutSeconds: 30, // mensagem presa só voltaria depois disto
+      batchSize: 10,
+      shutdownGraceMs: 15_000,
+    };
+    const metricsA = new AppMetrics();
+    const a = new WagerTransactionConsumer(gateway, app.processTransaction, metricsA, logger, options);
+    a.start();
+    await Bun.sleep(500); // A está bloqueado no ReceiveMessage (fila vazia), sozinho
+
+    const stopStartedAt = Date.now();
+    const stopping = a.stop(); // "SIGTERM" com o long poll em andamento
+    for (const c of cmds) await send(wagerMessage(messageData(c)).body, c.walletId); // chegam ao poll de A
+    await stopping;
+    const stopMs = Date.now() - stopStartedAt;
+
+    // o poll de A (não abortado) recebeu mensagens e as devolveu (visibility 0) sem processar nenhuma.
+    // O SQS encerra o long poll assim que há mensagem: o poll pode trazer só a 1ª; as outras nem passam por A.
+    const outcomesA = Object.fromEntries((await metricsA.sqsMessages.get()).values.map((v) => [v.labels.outcome, v.value]));
+    expect(Object.keys(outcomesA)).toEqual(['released']);
+    expect(outcomesA.released).toBeGreaterThanOrEqual(1);
+    expect(stopMs).toBeLessThan(options.waitTimeSeconds * 1_000 + 2_000); // terminou com o poll, sem abortá-lo
+    for (const c of cmds) expect(await statusOf(c.idempotencyKey)).toBeUndefined();
+
+    // outro consumer ("outra réplica") processa em segundos, não depois do visibility timeout
+    const handoffStartedAt = Date.now();
+    consumer({ waitTimeSeconds: 1 }).start();
+    await waitFor(async () => {
+      const statuses = await Promise.all(cmds.map((c) => statusOf(c.idempotencyKey)));
+      return statuses.every((r) => r?.status === 'PROCESSED') || undefined;
+    }, 10_000);
+    const handoffMs = Date.now() - handoffStartedAt;
+    expect(handoffMs).toBeLessThan(5_000); // << 30 s de visibility
+    for (const w of wallets) expect(await walletBalance(app.orm, w.id)).toBe('95.00');
+  }, 40_000);
+});
+
 describe('teto do heartbeat (maxProcessingMs)', () => {
   test('entrega travada além do teto: a visibilidade deixa de ser renovada, outro consumer recebe e a inbox evita o 2º efeito', async () => {
     const w = await wallet('100.00');

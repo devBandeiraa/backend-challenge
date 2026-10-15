@@ -330,7 +330,7 @@ na seção indicada e uma prova.
 | 7 | — | `WALLET_NOT_FOUND` não é persistido (422; ack sem inbox no SQS) | integridade referencial (FK) | decisão D; [use-cases.test.ts](test/integration/use-cases.test.ts) |
 | 8 | Taxonomia livre | códigos extras: `PLAYER_MISMATCH`, `REFERENCE_NOT_PROCESSED`, `WALLET_NOT_FOUND`, `PROCESSING_FAILED`, `BALANCE_LIMIT_EXCEEDED` | situações distintas para o provedor | §4.4 |
 | 9 | Escala fixa de 2 casas | mais de 2 casas é **rejeitado**, nunca arredondado | arredondar dinheiro esconde erro do provedor | §4.1; [money.test.ts](test/unit/domain/money.test.ts) |
-| 10 | Moeda ISO-4217 | só moedas correntes com unidade menor de 2 casas | a escala fixa não representa JPY (0) nem KWD (3) | §4.1; [money.test.ts](test/unit/domain/money.test.ts) |
+| 10 | Moeda ISO-4217 | na entrada, só moedas ISO-4217 correntes com unidade menor de **2 casas** (JPY, KRW, KWD, BHD, fundos, metais e códigos retirados → 400 `INVALID_MONEY`); dado já persistido é reidratado validando só o formato | a escala fixa de 2 casas não representa JPY (0) nem KWD (3); a lista pode mudar sem tornar dados ilegíveis | §4.1; [currency.ts](src/domain/shared/currency.ts); [money.test.ts](test/unit/domain/money.test.ts); [http-api.test.ts](test/integration/http-api.test.ts) |
 | 11 | — | crédito que estouraria NUMERIC(19,2) → REJECTED `BALANCE_LIMIT_EXCEEDED` | é regra de negócio, não erro interno | §4.2; [http-api.test.ts](test/integration/http-api.test.ts) |
 | 12 | Referência do mesmo provider (§7.2) | referência de **outro** provider não é encontrada → `REFERENCE_NOT_FOUND` após a janela | id externo só vale dentro do provedor; não vaza existência | §4.2; [http-api.test.ts](test/integration/http-api.test.ts) |
 | 13 | Replay devolve o resultado original | resultado terminal: mesmo status e corpo; **202 resolvido** devolve o desfecho atual | o estado mudou e o provedor precisa saber | §8; [pending-reference-worker.test.ts](test/integration/pending-reference-worker.test.ts) |
@@ -540,17 +540,34 @@ ainda o usar. Tabela nova numa migration futura precisa de `GRANT` explícito.
 
 ### 7.6 SIGTERM
 1. O Nest chama `beforeApplicationShutdown` **antes** de o ORM fechar o pool.
-2. O consumer para de receber (aborta o long polling) e conclui o que está em andamento
-   (`SHUTDOWN_GRACE_MS`, 20 s).
-3. As mensagens recebidas que não começaram voltam **na hora** para a fila (visibilidade 0).
-4. O que passar do prazo volta pela expiração da visibilidade.
+2. O consumer para de pedir mensagens. O long poll em andamento **não é abortado**: termina sozinho em até
+   `SQS_WAIT_TIME_SECONDS`. Abortar a requisição HTTP não cancela o `ReceiveMessage` no servidor: se o SQS já
+   tinha entregado mensagens a ela, essas mensagens ficavam invisíveis até o visibility timeout expirar (até 90 s),
+   sem ninguém processando. Foi a causa provável de uma execução do e2e de 104 s.
+3. Toda mensagem recebida que não começou, inclusive as que esse último poll trouxer, volta **na hora** para a
+   fila (`ChangeMessageVisibility` = 0) e é logada (`message released on shutdown`). Outra réplica a pega em segundos.
+4. O que já está em processamento termina dentro de `SHUTDOWN_GRACE_MS`; o que passar do prazo volta pela
+   expiração da visibilidade (nada se perde: inbox e key deduplicam).
 5. Os workers param no fim do tick, nunca no meio de uma transação.
 
-No compose: `init: true` (tini como PID 1, porque o Nest re-emite o sinal após o shutdown) e
-`stop_grace_period: 30s`.
+**Prazos (compose):**
+
+| Prazo | Valor | Regra |
+|---|---|---|
+| long poll (`SQS_WAIT_TIME_SECONDS`) | 5 s | — |
+| pior caso de processamento | 50,15 s | §7.3 |
+| `SHUTDOWN_GRACE_MS` | **60 s** | ≥ long poll + pior caso = 5 + 50,15 = 55,15 s. **A instância não sobe** se for menor; sem a variável, o padrão é exatamente esse mínimo |
+| `stop_grace_period` | **75 s** | > `SHUTDOWN_GRACE_MS` + 15 s para os workers terminarem o tick corrente (cada instrução limitada pelo `statement_timeout` de 15 s) e o Nest fechar o pool, antes do SIGKILL |
+
+No compose também: `init: true` (tini como PID 1, porque o Nest re-emite o sinal após o shutdown).
 
 **Provas:**
-- [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts);
+- [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts): "SIGTERM durante um long poll" (determinístico: o
+  único consumer recebe o stop com o poll aberto; as mensagens que chegam a ele são devolvidas e outro consumer as
+  processa em menos de 5 s, contra 30 s de visibility no teste) e "stop() conclui a mensagem em andamento";
+- [consumer-timing.test.ts](test/unit/infrastructure/consumer-timing.test.ts): o cálculo do prazo de shutdown;
+- e2e "SIGTERM durante o long poll": SIGTERM numa réplica ociosa e 30 mensagens logo em seguida; todas processadas
+  em menos de 20 s (mensagem presa levaria 90 s), com a contagem do que a vítima devolveu;
 - e2e: `docker kill --signal SIGTERM` numa réplica durante 120 mensagens. Resultado: shutdown cooperativo
   nos logs, saída 143, nada perdido ou duplicado, e a réplica volta healthy após `docker start`.
   O Docker não aplica restart policy após `docker kill`; em produção, quem recria é o orquestrador.
@@ -778,7 +795,7 @@ Dependências fixadas em versões publicadas há pelo menos 2 semanas.
 
 **Compose:**
 - `migrate` e `sqs-init` são serviços one-shot: as 3 réplicas não disputam o schema.
-- `app` roda com `replicas: 3`, `init: true` e `stop_grace_period: 30s`.
+- `app` roda com `replicas: 3`, `init: true` e `stop_grace_period: 75s` (cálculo em §7.6).
 - O nginx fica na porta 8088.
 - O `loadgen` (profile `load`) roda o teste de carga.
 - O Postgres fica na porta 5442 do host, para não colidir com outros Postgres locais.

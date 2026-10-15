@@ -56,6 +56,10 @@ export function loadConfig(): AppConfig {
     );
   }
 
+  const uowMaxAttempts = num('UOW_MAX_ATTEMPTS', 5);
+  const waitTimeSeconds = num('SQS_WAIT_TIME_SECONDS', 10);
+  const timing = { lockTimeoutMs, statementTimeoutMs, uowMaxAttempts };
+
   return {
     instanceId: process.env.INSTANCE_ID ?? hostname(),
     port: num('PORT', 3000),
@@ -68,7 +72,7 @@ export function loadConfig(): AppConfig {
       // Teto de qualquer instrução (query travada, rede meio-aberta): sem ele, o heartbeat do consumer
       // seguraria a mensagem (e o grupo FIFO da wallet) indefinidamente.
       statementTimeoutMs,
-      uowMaxAttempts: num('UOW_MAX_ATTEMPTS', 5),
+      uowMaxAttempts,
     },
     sqs: {
       endpoint: process.env.SQS_ENDPOINT ?? 'http://localhost:4566',
@@ -77,10 +81,11 @@ export function loadConfig(): AppConfig {
       eventsQueue: process.env.SQS_EVENTS_QUEUE ?? 'wager-events.fifo',
       consumerName: process.env.SQS_CONSUMER_NAME ?? 'wager-transactions-consumer',
       maxAttempts: num('SQS_CONSUMER_MAX_ATTEMPTS', 5),
-      waitTimeSeconds: num('SQS_WAIT_TIME_SECONDS', 10),
+      waitTimeSeconds,
       visibilityTimeoutSeconds: num('SQS_VISIBILITY_TIMEOUT_SECONDS', 90),
       batchSize: num('SQS_BATCH_SIZE', 10),
-      shutdownGraceMs: num('SHUTDOWN_GRACE_MS', 10_000),
+      // Padrão: o mínimo que cobre o long poll em andamento + o pior caso de processamento.
+      shutdownGraceMs: num('SHUTDOWN_GRACE_MS', requiredShutdownGraceMs(timing, waitTimeSeconds)),
     },
     // Lote 100: com 10 o publisher não acompanhou ~470 eventos/s (docs/load-test-analysis.md).
     outbox: { intervalMs: num('OUTBOX_INTERVAL_MS', 200), batchSize: num('OUTBOX_BATCH_SIZE', 100) },
@@ -125,6 +130,18 @@ export function maxMessageProcessingMs(db: Pick<AppConfig['db'], 'uowMaxAttempts
 export const VISIBILITY_SAFETY_FACTOR = 1.5;
 
 /**
+ * Prazo de shutdown do consumer: o long poll em andamento termina em até waitTimeSeconds (não é
+ * abortado) e cada mensagem já em processamento leva até o pior caso. As que o poll trouxer depois do
+ * SIGTERM são devolvidas na hora. Com os defaults do compose: 5 s + 50,15 s = 55,15 s.
+ */
+export function requiredShutdownGraceMs(
+  db: Pick<AppConfig['db'], 'uowMaxAttempts' | 'lockTimeoutMs' | 'statementTimeoutMs'>,
+  waitTimeSeconds: number,
+): number {
+  return Math.ceil(waitTimeSeconds * 1_000 + worstCaseMessageProcessingMs(db));
+}
+
+/**
  * Validação de startup: o visibility timeout cobre o pior caso com folga de 1,5×, MESMO que um
  * heartbeat falhe. Configuração inconsistente derruba a instância na subida, não em produção.
  */
@@ -136,6 +153,13 @@ export function assertConsumerTiming(config: Pick<AppConfig, 'db' | 'sqs'>): voi
         `processing time (${worstCaseMessageProcessingMs(config.db)} ms from UOW_MAX_ATTEMPTS=${config.db.uowMaxAttempts}, ` +
         `DB_LOCK_TIMEOUT_MS=${config.db.lockTimeoutMs}, DB_STATEMENT_TIMEOUT_MS=${config.db.statementTimeoutMs}); ` +
         `need at least ${Math.ceil(requiredMs / 1_000)} s`,
+    );
+  }
+  const graceMs = requiredShutdownGraceMs(config.db, config.sqs.waitTimeSeconds);
+  if (config.sqs.shutdownGraceMs < graceMs) {
+    throw new Error(
+      `SHUTDOWN_GRACE_MS=${config.sqs.shutdownGraceMs} is below the in-flight long poll (${config.sqs.waitTimeSeconds} s) + ` +
+        `worst-case processing (${worstCaseMessageProcessingMs(config.db)} ms); need at least ${graceMs} ms`,
     );
   }
 }

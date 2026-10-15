@@ -196,7 +196,7 @@ describe('SQS consumido por 3 consumers concorrentes', () => {
           [`{${keys.map((k) => `"${k}"`).join(',')}}`],
         );
       return Number(row?.n) === keys.length || undefined;
-    }, 120_000, 1_000);
+    }, 45_000, 1_000); // < visibility (90 s): mensagem presa num poll faria o teste falhar
 
     for (const w of wallets) {
       expect(await walletBalance(orm, w.id)).toBe('988.00');
@@ -204,7 +204,12 @@ describe('SQS consumido por 3 consumers concorrentes', () => {
       await assertLedgerInvariant(orm, w.id);
     }
 
-    // o shutdown foi cooperativo: consumer/workers parados pelo hook antes de o pool fechar
+    // o shutdown foi cooperativo: consumer/workers parados pelo hook antes de o pool fechar.
+    // A vítima sai só depois de o long poll em andamento terminar (não é abortado): espera ela sair.
+    await waitFor(async () => {
+      const running = new TextDecoder().decode(Bun.spawnSync(['docker', 'inspect', '-f', '{{.State.Running}}', victim]).stdout).trim();
+      return running === 'false' || undefined;
+    }, 30_000, 200);
     const logs = new TextDecoder().decode(Bun.spawnSync(['docker', 'logs', '--since', killedAt, victim]).stdout);
     expect(logs).toContain('"signal":"SIGTERM"');
     expect(logs).toContain('background processes stopped');
@@ -224,4 +229,52 @@ describe('SQS consumido por 3 consumers concorrentes', () => {
       return res.headers.get('x-instance-id') === hostname || undefined;
     }, 30_000, 100);
   }, 240_000);
+
+  test('SIGTERM durante o long poll: o que a réplica recebe é devolvido na hora e outra réplica processa em segundos', async () => {
+    const wallets = await Promise.all(Array.from({ length: 30 }, () => createWallet('100.00')));
+    const keys: string[] = [];
+    const bodies = wallets.map((w) => {
+      const body = { ...tx(w, { money: { amount: '3.00', currency: 'BRL' } }), idempotencyKey: '' };
+      body.idempotencyKey = `${body.providerId}:${body.externalTransactionId}`;
+      keys.push(body.idempotencyKey);
+      return body;
+    });
+    // réplicas ociosas: as três estão bloqueadas num long poll (SQS_WAIT_TIME_SECONDS=5)
+    const victim = new TextDecoder().decode(Bun.spawnSync(['docker', 'compose', 'ps', '-q', 'app']).stdout).trim().split('\n')[0]!;
+    const killedAt = new Date().toISOString();
+    expect(Bun.spawnSync(['docker', 'kill', '--signal', 'SIGTERM', victim]).exitCode).toBe(0);
+    const sentAt = performance.now();
+    // chegam enquanto o long poll da vítima ainda está aberto (ele não é abortado)
+    await Promise.all(bodies.map((b) => gateway.sendToInput(wagerMessage(b).body, b.walletId, crypto.randomUUID())));
+
+    await waitFor(async () => {
+      const [row] = await orm.em
+        .fork()
+        .execute<{ n: string }[]>(
+          `SELECT count(*)::text AS n FROM wager_transactions WHERE idempotency_key = ANY(?::text[]) AND status = 'PROCESSED'`,
+          [`{${keys.map((k) => `"${k}"`).join(',')}}`],
+        );
+      return Number(row?.n) === keys.length || undefined;
+    }, 30_000, 200);
+    const allProcessedMs = Math.round(performance.now() - sentAt);
+    // uma mensagem presa no poll da vítima só voltaria após o visibility timeout (90 s)
+    expect(allProcessedMs).toBeLessThan(20_000);
+    for (const w of wallets) expect(await walletBalance(orm, w.id)).toBe('97.00');
+
+    await waitFor(async () => {
+      const running = new TextDecoder().decode(Bun.spawnSync(['docker', 'inspect', '-f', '{{.State.Running}}', victim]).stdout).trim();
+      return running === 'false' || undefined;
+    }, 30_000, 200);
+    const logs = new TextDecoder().decode(Bun.spawnSync(['docker', 'logs', '--since', killedAt, victim]).stdout);
+    const releasedByVictim = logs.split('\n').filter((l) => l.includes('"message released on shutdown"')).length;
+    expect(logs).toContain('background processes stopped');
+    expect(new TextDecoder().decode(Bun.spawnSync(['docker', 'inspect', '-f', '{{.State.ExitCode}}', victim]).stdout).trim()).toBe('143');
+    console.log(JSON.stringify({ sigtermDuringLongPoll: { messages: keys.length, allProcessedMs, releasedByVictim } }));
+
+    expect(Bun.spawnSync(['docker', 'start', victim]).exitCode).toBe(0);
+    await waitFor(async () => {
+      const state = new TextDecoder().decode(Bun.spawnSync(['docker', 'inspect', '-f', '{{.State.Health.Status}}', victim]).stdout);
+      return state.trim() === 'healthy' || undefined;
+    }, 90_000, 1_000);
+  }, 180_000);
 });

@@ -94,7 +94,8 @@ services:
       # Cada réplica tem seu próprio pool, consumer SQS, publisher da outbox e worker de referências.
       DB_POOL_MAX: "10"
       SQS_WAIT_TIME_SECONDS: "5"
-      SHUTDOWN_GRACE_MS: "20000"
+      # >= long poll (5 s) + pior caso de processamento (50,15 s): a instância não sobe se for menor.
+      SHUTDOWN_GRACE_MS: "60000"
       # Lote maior por transação: com lote 10 o publisher não acompanhou ~470 eventos/s (lag de 19s no test:load).
       OUTBOX_BATCH_SIZE: "100"
     deploy:
@@ -102,8 +103,10 @@ services:
     # tini como PID 1: o SIGTERM chega à app, e o re-raise do sinal pelo Nest após o
     # shutdown encerra o processo (PID 1 ignora sinais sem handler).
     init: true
-    # > SHUTDOWN_GRACE_MS: o consumer conclui o que está em andamento antes do SIGKILL.
-    stop_grace_period: 30s
+    # stop_grace_period (75 s) > SHUTDOWN_GRACE_MS (60 s) >= long poll (5 s) + pior caso (50,15 s).
+    # Os 15 s restantes cobrem os workers terminarem o tick corrente (limitado pelo statement_timeout)
+    # e o Nest fechar o pool, antes do SIGKILL. Ver ARCHITECTURE.md §7.6.
+    stop_grace_period: 75s
     restart: unless-stopped
     depends_on:
       migrate: { condition: service_completed_successfully }

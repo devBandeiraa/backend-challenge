@@ -66,7 +66,6 @@ const SAFE_ID = /^[A-Za-z0-9._:-]{1,128}$/;
 export class WagerTransactionConsumer {
   private stopping = false;
   private loop: Promise<void> | undefined;
-  private abort = new AbortController();
   private readonly retryBackoff: ExponentialBackoff;
 
   constructor(
@@ -83,19 +82,24 @@ export class WagerTransactionConsumer {
   start(): void {
     if (this.loop) return;
     this.stopping = false;
-    this.abort = new AbortController();
     this.loop = this.run();
   }
 
   /**
-   * Shutdown (SIGTERM): para de receber, conclui o que está em andamento dentro do prazo e
-   * devolve imediatamente à fila (visibility 0) as mensagens recebidas que não começaram.
+   * Shutdown (SIGTERM): não pede mais mensagens, conclui o que está em andamento dentro do prazo e
+   * devolve imediatamente à fila (visibility 0) toda mensagem recebida que não começou.
+   *
+   * O long poll em andamento NÃO é abortado: ele termina sozinho em até waitTimeSeconds. Abortar a
+   * requisição HTTP não cancela o ReceiveMessage no servidor: se o SQS já tinha entregado mensagens a
+   * ela, essas mensagens ficavam invisíveis até o visibility timeout expirar (até 90 s de atraso), sem
+   * ninguém processando. Deixando o poll terminar, o que ele trouxer chega a processBatch com stopping
+   * = true e é devolvido na hora. O prazo de shutdown cobre o long poll + o pior caso (config.ts).
    * O que passar do prazo volta sozinho quando o visibility timeout expirar: nada se perde.
    */
   async stop(): Promise<void> {
     this.stopping = true;
-    this.abort.abort();
     if (!this.loop) return;
+    this.logger.info({ msg: 'consumer stopping: waiting for the in-flight long poll and messages in progress' });
     const finished = await Promise.race([
       this.loop.then(() => true),
       Bun.sleep(this.options.shutdownGraceMs).then(() => false),
@@ -112,7 +116,6 @@ export class WagerTransactionConsumer {
           maxMessages: this.options.batchSize,
           waitTimeSeconds: this.options.waitTimeSeconds,
           visibilityTimeoutSeconds: this.options.visibilityTimeoutSeconds,
-          abortSignal: this.abort.signal,
         });
       } catch (error) {
         if (this.stopping) break;
@@ -290,9 +293,11 @@ export class WagerTransactionConsumer {
     return 'dead_lettered';
   }
 
+  /** Shutdown: mensagem recebida que não começou volta para a fila na hora (outra réplica a pega). */
   private async release(message: ReceivedMessage): Promise<Disposition> {
     await this.gateway.changeVisibility(message, 0).catch(() => undefined);
     this.metrics.sqsMessages.inc({ outcome: 'released' });
+    this.logger.info({ msg: 'message released on shutdown', sqsMessageId: message.sqsMessageId, groupId: message.groupId });
     return 'released';
   }
 

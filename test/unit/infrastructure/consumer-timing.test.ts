@@ -1,8 +1,15 @@
 import { describe, expect, test } from 'bun:test';
-import { assertConsumerTiming, maxMessageProcessingMs, worstCaseMessageProcessingMs } from '../../../src/infrastructure/config';
+import {
+  assertConsumerTiming,
+  maxMessageProcessingMs,
+  requiredShutdownGraceMs,
+  worstCaseMessageProcessingMs,
+} from '../../../src/infrastructure/config';
 
 const db = { url: '', poolMax: 10, lockTimeoutMs: 5_000, statementTimeoutMs: 15_000, uowMaxAttempts: 5 };
-const sqs = (visibilityTimeoutSeconds: number) => ({ visibilityTimeoutSeconds }) as never;
+// defaults do compose: long poll de 5 s, SHUTDOWN_GRACE_MS 60 s
+const sqs = (visibilityTimeoutSeconds: number, shutdownGraceMs = 60_000, waitTimeSeconds = 5) =>
+  ({ visibilityTimeoutSeconds, shutdownGraceMs, waitTimeSeconds }) as never;
 const BACKOFF = 10 + 20 + 40 + 80;
 
 describe('validação de timing do consumer no startup', () => {
@@ -20,8 +27,17 @@ describe('validação de timing do consumer no startup', () => {
 
   test('acompanha a configuração: lock_timeout e statement_timeout maiores exigem visibility maior', () => {
     const slow = { ...db, lockTimeoutMs: 10_000, statementTimeoutMs: 25_000 }; // 4×10 + 2×25 = 90 s
-    expect(() => assertConsumerTiming({ db: slow, sqs: sqs(120) })).toThrow();
-    expect(() => assertConsumerTiming({ db: slow, sqs: sqs(136) })).not.toThrow();
+    expect(() => assertConsumerTiming({ db: slow, sqs: sqs(120, 100_000) })).toThrow(/VISIBILITY/);
+    expect(() => assertConsumerTiming({ db: slow, sqs: sqs(136, 100_000) })).not.toThrow();
+    expect(() => assertConsumerTiming({ db: slow, sqs: sqs(136, 60_000) })).toThrow(/SHUTDOWN_GRACE_MS/); // 5 + 90,15 s
+  });
+
+  test('prazo de shutdown >= long poll em andamento + pior caso: 5 s + 50,15 s = 55,15 s', () => {
+    expect(requiredShutdownGraceMs(db, 5)).toBe(5_000 + 50_000 + BACKOFF);
+    expect(() => assertConsumerTiming({ db, sqs: sqs(90, 60_000, 5) })).not.toThrow();
+    expect(() => assertConsumerTiming({ db, sqs: sqs(90, 20_000, 5) })).toThrow(/SHUTDOWN_GRACE_MS=20000 .* need at least 55150 ms/);
+    // long poll maior exige prazo maior
+    expect(() => assertConsumerTiming({ db, sqs: sqs(90, 60_000, 20) })).toThrow(/need at least 70150 ms/);
   });
 
   test('o teto do heartbeat é o mesmo pior caso × 1,5', () => {
