@@ -41,6 +41,7 @@ async function bet(w: { id: string; playerId: string }, amount: string) {
   });
 }
 
+// Invariante: verificado ao fim do teste consistente; as wallets corrompidas abaixo divergem DE PROPÓSITO.
 /** Escrita que contorna a aplicação E os triggers: exige a conexão do owner (superuser no compose de dev). */
 async function corrupt(sql: string, params: unknown[]) {
   await ownerOrm.em.fork().transactional(async (em) => {

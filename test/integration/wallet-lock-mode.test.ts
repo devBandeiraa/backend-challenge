@@ -7,9 +7,11 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
+import { ledgerInvariantSinceTestStart } from '../support/invariants';
 import { createTestOrm } from '../support/db';
 
 let orm: MikroORM;
+ledgerInvariantSinceTestStart(() => orm);
 
 beforeAll(async () => {
   orm = await createTestOrm();

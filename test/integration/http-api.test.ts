@@ -1,20 +1,20 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
-import { assertLedgerInvariant } from '../support/app-context';
+
 import { createTestOrm } from '../support/db';
+import { ledgerInvariantAfterEach } from '../support/invariants';
 import { http, startHttpApp } from '../support/http-app';
 
 let baseUrl: string;
 let close: () => Promise<void>;
 let orm: MikroORM;
-const touched: string[] = [];
+const touch = ledgerInvariantAfterEach(() => orm);
 
 beforeAll(async () => {
   ({ baseUrl, close } = await startHttpApp());
   orm = await createTestOrm(2);
 });
 afterAll(async () => {
-  for (const id of touched) await assertLedgerInvariant(orm, id);
   await close();
   await orm.close(true);
 });
@@ -24,7 +24,7 @@ const call = (method: string, path: string, options?: Parameters<typeof http>[3]
 async function createWallet(amount = '1000.00') {
   const res = await call('POST', '/wallets', { body: { playerId: crypto.randomUUID(), initialBalance: { amount, currency: 'BRL' } } });
   expect(res.status).toBe(201);
-  touched.push(res.body.id);
+  touch(res.body.id);
   return res.body as { id: string; playerId: string };
 }
 
@@ -51,7 +51,7 @@ describe('POST /wallets', () => {
     const res = await call('POST', '/wallets', { body: { playerId, initialBalance: { amount: '1000.00', currency: 'BRL' } } });
     expect(res.status).toBe(201);
     expect(res.body).toEqual({ id: expect.any(String), playerId, balance: { amount: '1000.00', currency: 'BRL' }, version: 1 });
-    touched.push(res.body.id);
+    touch(res.body.id);
   });
 
   test('409 em wallet duplicada (player + moeda)', async () => {

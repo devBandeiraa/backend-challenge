@@ -3,32 +3,23 @@
  * resolvidos pelo worker (SKIP LOCKED) com backoff e limite de tentativas. Postgres real.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
-import {
-  type AppContext,
-  assertLedgerInvariant,
-  countRows,
-  createAppContext,
-  inParallel,
-  openTestWallet,
-  wagerCommand,
-  walletBalance,
-} from '../support/app-context';
+import { type AppContext, countRows, createAppContext, inParallel, openTestWallet, wagerCommand, walletBalance } from '../support/app-context';
+import { ledgerInvariantAfterEach } from '../support/invariants';
 
 let app: AppContext;
-const touched: string[] = [];
+const touch = ledgerInvariantAfterEach(() => app.orm);
 
 beforeAll(async () => {
   // Backoff curto (50ms, sem jitter) e 4 tentativas para o teste não depender de minutos.
   app = await createAppContext({ pending: { maxAttempts: 4, baseMs: 50, maxMs: 200 } });
 });
 afterAll(async () => {
-  for (const id of touched) await assertLedgerInvariant(app.orm, id);
   await app.close();
 });
 
 async function wallet(amount = '100.00') {
   const w = await openTestWallet(app, amount);
-  touched.push(w.id);
+  touch(w.id);
   return w;
 }
 
@@ -115,7 +106,7 @@ describe('referência nunca chega', () => {
   test('não reprocessa antes de next_attempt_at (backoff respeitado)', async () => {
     const slow = await createAppContext({ poolMax: 3, pending: { maxAttempts: 10, baseMs: 60_000, maxMs: 60_000 } });
     const w = await openTestWallet(slow, '10.00');
-    touched.push(w.id);
+    touch(w.id);
     const out = await slow.processTransaction.execute(wagerCommand(w, { kind: 'REFUND', referenceExternalTransactionId: 'later' }));
     await slow.resolvePending.runOnce(500);
     expect(await status(out.transactionId)).toMatchObject({ status: 'PENDING_REFERENCE', attempts: 1 });

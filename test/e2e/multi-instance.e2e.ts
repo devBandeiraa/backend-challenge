@@ -9,13 +9,14 @@ import type { MikroORM } from '@mikro-orm/postgresql';
 import { DEFAULT_QUEUE_NAMES, createSqsClient } from '../../src/infrastructure/messaging/sqs/sqs-config';
 import { SqsGateway } from '../../src/infrastructure/messaging/sqs/sqs-gateway';
 import { assertLedgerInvariant, barrier, countRows, walletBalance } from '../support/app-context';
+import { ledgerInvariantAfterEach } from '../support/invariants';
 import { createTestOrm } from '../support/db';
 import { waitFor, wagerMessage } from '../support/sqs';
 
 const BASE_URL = process.env.MULTI_INSTANCE_URL ?? 'http://localhost:8088';
 let orm: MikroORM;
 let gateway: SqsGateway;
-const touched = new Set<string>();
+const touch = ledgerInvariantAfterEach(() => orm);
 
 beforeAll(async () => {
   const health = await fetch(`${BASE_URL}/health/ready`).catch(() => undefined);
@@ -24,7 +25,6 @@ beforeAll(async () => {
   gateway = await SqsGateway.connect(createSqsClient(), DEFAULT_QUEUE_NAMES);
 });
 afterAll(async () => {
-  for (const id of touched) await assertLedgerInvariant(orm, id);
   await orm?.close(true);
 });
 
@@ -57,7 +57,7 @@ afterAll(() => {
 async function createWallet(amount: string) {
   const res = await post('/wallets', { playerId: crypto.randomUUID(), initialBalance: { amount, currency: 'BRL' } });
   expect(res.status).toBe(201);
-  touched.add(res.body.id);
+  touch(res.body.id);
   return res.body as { id: string; playerId: string };
 }
 

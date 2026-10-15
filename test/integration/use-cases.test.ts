@@ -1,15 +1,15 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { IdempotencyConflictError, UnknownWalletError, ValidationError, WalletAlreadyExistsError } from '../../src/application/errors';
 import { type AppContext, assertLedgerInvariant, countRows, createAppContext, wagerCommand } from '../support/app-context';
+import { ledgerInvariantAfterEach } from '../support/invariants';
 
 let app: AppContext;
-const touched: string[] = [];
+const touch = ledgerInvariantAfterEach(() => app.orm);
 
 beforeAll(async () => {
   app = await createAppContext();
 });
 afterAll(async () => {
-  for (const id of touched) await assertLedgerInvariant(app.orm, id);
   await app.close();
 });
 
@@ -19,7 +19,7 @@ async function wallet(amount = '100.00', currency = 'BRL') {
     initialBalance: { amount, currency },
     correlationId: 'test',
   });
-  touched.push(w.id);
+  touch(w.id);
   return w;
 }
 
@@ -45,7 +45,7 @@ describe('OpenWallet', () => {
       app.openWallet.execute({ playerId: w.playerId, initialBalance: { amount: '5.00', currency: 'BRL' }, correlationId: 't' }),
     ).rejects.toBeInstanceOf(WalletAlreadyExistsError);
     const usd = await app.openWallet.execute({ playerId: w.playerId, initialBalance: { amount: '5.00', currency: 'USD' }, correlationId: 't' });
-    touched.push(usd.id);
+    touch(usd.id);
     expect(usd.balance.currency).toBe('USD');
   });
 

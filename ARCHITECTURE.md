@@ -113,12 +113,13 @@ Todos os testes usam **Postgres e LocalStack reais**. "e2e" = `bun run test:mult
 | Reconciliação: loga, mede e sinaliza sem corrigir (9) | [reconcile-wallet.ts](src/application/wallets/reconcile-wallet.ts) | [reconciliation.test.ts](test/integration/reconciliation.test.ts) (divergência forçada com `session_replication_role = replica`) |
 | Health live/ready abertos; ready = Postgres + SQS (9, 12) | [health.controller.ts](src/interfaces/http/health.controller.ts) | [observability.test.ts](test/integration/observability.test.ts), [http-api.test.ts](test/integration/http-api.test.ts) |
 | Consumer: mesmo use case, inbox, ack após commit, negócio/transitório/permanente, limite → DLQ, SIGTERM, redelivery (10) | [wager-transaction.consumer.ts](src/interfaces/sqs/wager-transaction.consumer.ts) | [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts), [crash-after-commit.test.ts](test/concurrency/crash-after-commit.test.ts), e2e (SIGTERM) |
-| Outbox atômica; publishers concorrentes; crash antes de publicar (11) | [outbox-publisher.ts](src/infrastructure/workers/outbox-publisher.ts) | [outbox-publisher.test.ts](test/integration/outbox-publisher.test.ts), [restart-consistency.test.ts](test/recovery/restart-consistency.test.ts) |
+| Atomicidade inbox + transação + wallet + ledger + outbox (6.5, 11) | um único `uow.run` por submissão | [atomicity.test.ts](test/integration/atomicity.test.ts): falha injetada DEPOIS de todas as escritas (HTTP e SQS) → nada persiste |
+| Outbox: publishers concorrentes; cenário de 5 passos com processos reais (11) | [outbox-publisher.ts](src/infrastructure/workers/outbox-publisher.ts) | [outbox-crash.test.ts](test/recovery/outbox-crash.test.ts): processo morto com SIGKILL antes de publicar (segurando as linhas) e depois do SendMessage; OUTRO processo publica; cada evento chega uma vez · [outbox-publisher.test.ts](test/integration/outbox-publisher.test.ts) (2 publishers) · [restart-consistency.test.ts](test/recovery/restart-consistency.test.ts) |
 | Eventos: classe abstrata + subclasses; `data` com MoneyProps; BalanceChanged só se o saldo mudou (11) | [wagering-events.ts](src/domain/events/wagering-events.ts) | [messaging.test.ts](test/unit/domain/messaging.test.ts), [use-cases.test.ts](test/integration/use-cases.test.ts) (LOSS sem BalanceChanged) |
 | Logs JSON com ids, sem payload financeiro (12) | pino + AsyncLocalStorage | [observability.test.ts](test/integration/observability.test.ts) |
 | Métricas mínimas (12) | [metrics.ts](src/infrastructure/observability/metrics.ts) | [observability.test.ts](test/integration/observability.test.ts), [transient-failures.test.ts](test/integration/transient-failures.test.ts) |
 | Concorrência 1–8 (13) | — | 1: [same-operation](test/concurrency/same-operation.test.ts) · 2: [hot-wallet](test/concurrency/hot-wallet.test.ts) · 3: [distinct-wallets](test/concurrency/distinct-wallets.test.ts) · 4: e2e · 5: [crash-after-commit](test/concurrency/crash-after-commit.test.ts) · 6: [outbox-publisher](test/integration/outbox-publisher.test.ts) · 7: [pending-reference-worker](test/integration/pending-reference-worker.test.ts) · 8: [restart-consistency](test/recovery/restart-consistency.test.ts) |
-| Invariante final `balance == ledger` em todos | `assertLedgerInvariant()` | [app-context.ts](test/support/app-context.ts); chamada nos testes de concorrência, integração, recuperação e e2e |
+| Invariante final `balance == ledger` em todos | `assertLedgerInvariant()` em `afterEach` | [invariants.ts](test/support/invariants.ts): wallets tocadas pelo teste corrente (integração, observabilidade, recuperação, e2e); nos testes de SQL puro, toda wallet criada/alterada desde o início do teste; nos de concorrência, ao fim de cada teste. Exceção deliberada: as wallets corrompidas de propósito na reconciliação |
 | Teste de carga (diferencial) | `bun run test:load` | [load-test-report.md](docs/load-test-report.md), [load-test-analysis.md](docs/load-test-analysis.md) |
 
 ---
@@ -619,7 +620,7 @@ Trocar o guard por essa implementação não altera controllers nem use cases.
 | Unidade | `bun run test:unit` | Money, Wallet, ledger, máquina de estados, política por kind, eventos, backoff, payloadHash, timing do consumer |
 | Integração | `bun run test:integration` | schema (SQL puro), use cases, HTTP, consumer, outbox, worker, reconciliação, logs, 503 |
 | Concorrência | `bun run test:concurrency` | barreira + 3 pools; 50× mesma aposta; 100/80/80 ×20; hot wallet; reversões concorrentes; crash após commit (processo real) |
-| Recuperação | `bun run test:recovery` | processo real da app morto com kill -9 no meio da carga, restart, reenvio com as mesmas keys |
+| Recuperação | `bun run test:recovery` | processo real da app morto com kill -9 no meio da carga, restart, reenvio com as mesmas keys; publisher da outbox morto com SIGKILL e outro processo publicando |
 | **≥ 3 instâncias** | **`bun run test:multi`** | compose com 3 réplicas + nginx; distribuição comprovada por `X-Instance-Id`; consumers concorrentes; SIGTERM |
 | Tudo | **`bun run test:all`** | `test` + `test:multi` |
 | Carga | `bun run test:load` | seção [13](#13-carga) |
@@ -632,8 +633,9 @@ Trocar o guard por essa implementação não altera controllers nem use cases.
 - **Isolamento:** filas exclusivas por teste e ids próprios, sem TRUNCATE.
 - **Concorrência real:** barreira (`inParallel`): todas as operações só disparam quando todas estão
   prontas. Cenários repetidos para exercitar várias intercalações.
-- **`assertLedgerInvariant()`** em todos os testes de concorrência, recuperação e e2e: saldo armazenado =
-  soma do ledger e `version` = último lançamento, calculados no banco com NUMERIC.
+- **`assertLedgerInvariant()` ao fim de cada teste** (`afterEach`, [invariants.ts](test/support/invariants.ts)): saldo
+  armazenado = soma do ledger e `version` = último lançamento, calculados no banco com NUMERIC. Vale para as wallets
+  tocadas pelo teste; nos testes de SQL puro, para toda wallet criada ou alterada desde o início dele.
 - **Guard:** `bun run test` recusa rodar com réplicas do compose no ar, porque publishers e workers delas
   concorreriam com as medições. `test:multi` sobe as réplicas e as desliga no fim.
 - **Timeout:** passado por `--timeout` nos scripts. Um `setDefaultTimeout` no preload só valeria para o

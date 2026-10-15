@@ -10,8 +10,11 @@ export interface OutboxPublisherOptions {
   batchSize: number;
   /** Teto de cada instrução da transação de publicação (SET LOCAL statement_timeout). */
   statementTimeoutMs?: number;
-  /** Injeção de falha para testes: chamado após o SendMessage e ANTES do commit. */
-  hooks?: { afterSend?(eventIds: string[]): Promise<void> | void };
+  /**
+   * Injeção de falha para testes de crash com processo real: beforeSend roda com o lote já reivindicado
+   * (linhas travadas) e ANTES do SendMessage; afterSend roda depois do SendMessage e ANTES do commit.
+   */
+  hooks?: { beforeSend?(eventIds: string[]): Promise<void> | void; afterSend?(eventIds: string[]): Promise<void> | void };
 }
 
 /**
@@ -49,6 +52,7 @@ export class OutboxPublisher {
           },
         );
         if (rows.length === 0) return { published: 0, failed: 0 };
+        await this.options.hooks?.beforeSend?.(rows.map((r) => r.id));
 
         let failures: Map<string, string>;
         try {

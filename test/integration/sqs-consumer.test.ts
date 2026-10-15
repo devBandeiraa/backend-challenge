@@ -8,16 +8,8 @@ import { ExponentialBackoff } from '../../src/domain/messaging/backoff-policy';
 import { AppMetrics } from '../../src/infrastructure/observability/metrics';
 import { createLogger } from '../../src/infrastructure/observability/logger';
 import { type ConsumerOptions, WagerTransactionConsumer } from '../../src/interfaces/sqs/wager-transaction.consumer';
-import {
-  type AppContext,
-  assertLedgerInvariant,
-  countRows,
-  createAppContext,
-  messageData,
-  openTestWallet,
-  wagerCommand,
-  walletBalance,
-} from '../support/app-context';
+import { type AppContext, countRows, createAppContext, messageData, openTestWallet, wagerCommand, walletBalance } from '../support/app-context';
+import { ledgerInvariantAfterEach } from '../support/invariants';
 import { createTestQueues, drain, type SqsGateway, waitFor, wagerMessage } from '../support/sqs';
 import type { SQSClient } from '@aws-sdk/client-sqs';
 
@@ -26,7 +18,7 @@ let gateway: SqsGateway;
 let client: SQSClient;
 const logger = createLogger({ test: 'sqs-consumer' });
 logger.level = 'silent';
-const touched: string[] = [];
+const touch = ledgerInvariantAfterEach(() => app.orm);
 const running: WagerTransactionConsumer[] = [];
 
 beforeAll(async () => {
@@ -40,7 +32,6 @@ afterEach(async () => {
   await Promise.all(running.splice(0).map((c) => c.stop()));
 });
 afterAll(async () => {
-  for (const id of touched) await assertLedgerInvariant(app.orm, id);
   await app.close();
 });
 
@@ -61,7 +52,7 @@ function consumer(overrides: Partial<ConsumerOptions> = {}) {
 
 async function wallet(amount = '100.00') {
   const w = await openTestWallet(app, amount);
-  touched.push(w.id);
+  touch(w.id);
   return w;
 }
 

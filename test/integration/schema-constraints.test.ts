@@ -6,9 +6,12 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import { MikroORM } from '@mikro-orm/postgresql';
 import { buildOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { migrate } from '../../src/infrastructure/persistence/migrate';
+import { ledgerInvariantSinceTestStart } from '../support/invariants';
 import { createOwnerOrm, TEST_DATABASE_URL, TEST_OWNER_DATABASE_URL } from '../support/db';
 
 let orm: MikroORM;
+// Toda wallet que um teste conseguiu confirmar (o schema recusa o resto) termina consistente com o ledger.
+ledgerInvariantSinceTestStart(() => orm);
 const uuid = () => crypto.randomUUID();
 const HASH = 'a'.repeat(64);
 

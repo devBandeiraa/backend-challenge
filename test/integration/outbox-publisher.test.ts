@@ -10,14 +10,8 @@ import { createLogger } from '../../src/infrastructure/observability/logger';
 import { AppMetrics } from '../../src/infrastructure/observability/metrics';
 import type { OutgoingEvent, SqsGateway } from '../../src/infrastructure/messaging/sqs/sqs-gateway';
 import { OutboxPublisher } from '../../src/infrastructure/workers/outbox-publisher';
-import {
-  type AppContext,
-  assertLedgerInvariant,
-  createAppContext,
-  inParallel,
-  openTestWallet,
-  wagerCommand,
-} from '../support/app-context';
+import { type AppContext, createAppContext, inParallel, openTestWallet, wagerCommand } from '../support/app-context';
+import { ledgerInvariantAfterEach } from '../support/invariants';
 import { createTestOrm } from '../support/db';
 import { createTestQueues, drain } from '../support/sqs';
 
@@ -27,7 +21,7 @@ let app: AppContext;
 let gateway: SqsGateway;
 let client: SQSClient;
 let eventsQueueName: string;
-const touched: string[] = [];
+const touch = ledgerInvariantAfterEach(() => app.orm);
 
 beforeAll(async () => {
   app = await createAppContext();
@@ -41,7 +35,6 @@ beforeAll(async () => {
   await drain(client, gateway.urls.events, 1_000);
 }, 180_000); // backlog pode ter milhares de eventos dos testes de concorrência
 afterAll(async () => {
-  for (const id of touched) await assertLedgerInvariant(app.orm, id);
   await app.close();
 });
 
@@ -58,7 +51,7 @@ function countingGateway(real: SqsGateway, sent: Map<string, number>): SqsGatewa
 /** Gera eventos confirmados (via use case real) e devolve os eventIds. */
 async function produceEvents(bets: number): Promise<{ walletId: string; eventIds: string[] }> {
   const w = await openTestWallet(app, '1000.00');
-  touched.push(w.id);
+  touch(w.id);
   for (let i = 0; i < bets; i++) await app.processTransaction.execute(wagerCommand(w, { money: { amount: '1.00', currency: 'BRL' } }));
   const rows = await app.orm.em
     .fork()

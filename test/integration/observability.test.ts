@@ -3,21 +3,28 @@
  * carrega payload financeiro. Readiness e métricas.
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
+import type { MikroORM } from '@mikro-orm/postgresql';
 import { createLogger } from '../../src/infrastructure/observability/logger';
 import { WagerTransactionConsumer } from '../../src/interfaces/sqs/wager-transaction.consumer';
 import { createAppContext, messageData, openTestWallet, wagerCommand } from '../support/app-context';
+import { ledgerInvariantAfterEach } from '../support/invariants';
+import { createTestOrm } from '../support/db';
 import { http, parseLogLines, startHttpApp } from '../support/http-app';
 import { createTestQueues, waitFor, wagerMessage } from '../support/sqs';
 
 let baseUrl: string;
 let close: () => Promise<void>;
+let orm: MikroORM;
 const logLines: string[] = [];
+const touch = ledgerInvariantAfterEach(() => orm);
 
 beforeAll(async () => {
   ({ baseUrl, close } = await startHttpApp({ logLines }));
+  orm = await createTestOrm(2);
 });
 afterAll(async () => {
   await close();
+  await orm.close(true);
 });
 
 /** Nenhum valor monetário nos logs: nem campos money/balance/amount, nem os valores usados. */
@@ -32,6 +39,7 @@ describe('logs HTTP', () => {
   test('linha por requisição com correlationId, walletId, providerId, transactionId; sem valores', async () => {
     logLines.length = 0;
     const w = (await http(baseUrl, 'POST', '/wallets', { body: { playerId: crypto.randomUUID(), initialBalance: { amount: '4321.98', currency: 'BRL' } } })).body;
+    touch(w.id);
     const ext = `obs-${crypto.randomUUID()}`;
     const res = await http(baseUrl, 'POST', '/wagering/transactions', {
       headers: { 'idempotency-key': `provider-obs:${ext}`, 'x-correlation-id': 'corr-obs-1' },
@@ -71,6 +79,7 @@ describe('logs do consumer SQS', () => {
     const app = await createAppContext({ poolMax: 3 });
     const { gateway } = await createTestQueues('obs');
     const w = await openTestWallet(app, '777.77');
+    touch(w.id);
     const cmd = wagerCommand(w, { money: { amount: '55.55', currency: 'BRL' }, providerId: 'provider-sqs' });
     const msg = wagerMessage(messageData(cmd), `msg-obs-${crypto.randomUUID()}`, { correlationId: 'corr-sqs-1' });
     await gateway.sendToInput(msg.body, w.id, crypto.randomUUID());
