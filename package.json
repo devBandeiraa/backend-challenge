@@ -17,6 +17,7 @@
     "test:recovery": "bun test --timeout 60000 test/recovery",
     "test:multi": "bun run scripts/test-multi.ts",
     "test:all": "bun run test && bun run test:multi",
+    "test:load": "bun run scripts/load-test.ts",
     "infra:up": "docker compose up -d postgres localstack migrate sqs-init",
     "stack:up": "docker compose up -d --build",
     "queues:provision": "bun run src/infrastructure/messaging/sqs/provision-queues.ts",

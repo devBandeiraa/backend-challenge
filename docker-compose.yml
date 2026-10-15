@@ -91,6 +91,8 @@ services:
       DB_POOL_MAX: "10"
       SQS_WAIT_TIME_SECONDS: "5"
       SHUTDOWN_GRACE_MS: "20000"
+      # Lote maior por transação: com lote 10 o publisher não acompanhou ~470 eventos/s (lag de 19s no test:load).
+      OUTBOX_BATCH_SIZE: "100"
     deploy:
       replicas: 3
     # tini como PID 1: o SIGTERM chega à app, e o re-raise do sinal pelo Nest após o
@@ -107,6 +109,15 @@ services:
       interval: 5s
       timeout: 3s
       retries: 10
+
+  loadgen:
+    # Gerador de carga (bun run test:load) DENTRO da rede: mede sem o proxy de portas do host.
+    build: { context: ., dockerfile: docker/loadgen.Dockerfile }
+    profiles: ["load"]
+    environment:
+      <<: *app-env
+      LOAD_BASE_URL: http://nginx:80
+      LOG_LEVEL: silent
 
   nginx:
     # Ponto de entrada HTTP único que distribui entre as réplicas (DNS do compose resolve "app" para todas).
