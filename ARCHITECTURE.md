@@ -108,7 +108,7 @@ ao esgotar, a transação vira `REJECTED`/`REFERENCE_NOT_FOUND` e o evento corre
 
 | Item | Versão | Observação |
 |---|---|---|
-| Bun | 1.4.3 | runtime, package manager, test runner |
+| Bun | 1.4.2 | runtime, package manager, test runner (mesma versão no host e na imagem) |
 | NestJS | 12.1.2 | ESM; DI por `emitDecoratorMetadata` funciona no Bun |
 | MikroORM | 7.2.3 | driver `pg`; migrations por `migrationsList` explícita |
 | PostgreSQL | 17.11 | |
@@ -116,6 +116,27 @@ ao esgotar, a transação vira `REJECTED`/`REFERENCE_NOT_FOUND` e o evento corre
 
 Dependências fixadas em versões publicadas há pelo menos 2 semanas.
 
-**LocalStack:** as imagens 2026.x terminam com exit 55 sem `LOCALSTACK_AUTH_TOKEN`. A 4.14.0 é a última
-community que roda sem licença e suporta SQS FIFO + redrive. Fallback testado: MiniStack
-(`ministackorg/ministack:1.5.27`), que o enunciado também aceita.
+### Emulador SQS: LocalStack 4.14.0 congelado, MiniStack como alternativa
+
+- **Contexto:** a partir das releases 2026.x, o LocalStack consolidou as edições numa imagem única
+  que exige `LOCALSTACK_AUTH_TOKEN`. Sem licença, o container termina com exit 55
+  (verificado com `2026.08.5`).
+- **Decisão:** usar `localstack/localstack:4.14.0` (fev/2026), a última imagem community
+  **pré-consolidação**. Ela roda **sem token**, e o suporte a SQS FIFO + RedrivePolicy foi verificado.
+  A versão fica **congelada**: atualizar para 2026.x quebraria o setup de quem não tem conta LocalStack.
+- **Alternativa:** MiniStack (`ministackorg/ministack:1.5.27`, MIT, citado no enunciado) via profile:
+  `COMPOSE_PROFILES=ministack docker compose up -d`. Também verificado: as 3 réplicas sobem healthy.
+- **Como os dois são intercambiáveis:**
+  - os dois serviços expõem o alias de rede `sqs:4566`;
+  - as filas são criadas por código da aplicação ([provision-queues.ts](src/infrastructure/messaging/sqs/provision-queues.ts)),
+    idempotente e executado pelo serviço one-shot `sqs-init` e pelo setup dos testes, em vez do init script
+    `ready.d` do LocalStack, que só existe nele;
+  - o profile padrão vem de `.env` (`COMPOSE_PROFILES=localstack`), que contém só defaults não sensíveis.
+- **Trade-off:** 4.14.0 não recebe mais correções. Como é só emulador de SQS para dev/teste, o risco é baixo,
+  e o MiniStack cobre o caso de incompatibilidade futura.
+
+### Compose: 3 réplicas atrás do nginx
+`app` roda com `deploy.replicas: 3`, e o nginx (porta 8088) distribui as requisições usando o DNS do compose.
+`proxy_next_upstream off` impede o nginx de reenviar um POST para outra réplica: o retry é decisão do
+cliente, que tem a Idempotency-Key. As migrations rodam num serviço one-shot (`migrate`) antes
+das réplicas, e não no boot de cada uma, para evitar 3 instâncias disputando o mesmo schema.
