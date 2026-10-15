@@ -36,10 +36,10 @@ beforeAll(async () => {
   eventsQueueName = queues.names.events;
   // A outbox acumula eventos dos outros testes (nenhum publisher roda neles). Escoa o backlog
   // antes, para que cada teste meça só os próprios eventos.
-  const publisher = new OutboxPublisher(app.orm, gateway, new AppMetrics(), logger, { batchSize: 100 });
+  const publisher = new OutboxPublisher(app.orm, gateway, new AppMetrics(), logger, { batchSize: 200 });
   while ((await publisher.publishOnce()).published > 0);
   await drain(client, gateway.urls.events, 1_000);
-});
+}, 180_000); // backlog pode ter milhares de eventos dos testes de concorrência
 afterAll(async () => {
   for (const id of touched) await assertLedgerInvariant(app.orm, id);
   await app.close();

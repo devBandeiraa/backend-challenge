@@ -1,3 +1,4 @@
 [test]
-# Testes de integração usam Postgres e SQS reais (long polling, backoff em segundos).
+# Guard: recusa rodar com réplicas do compose no ar (ver test/setup.ts).
+# Timeout dos testes de integração: passado por --timeout nos scripts do package.json.
 preload = ["./test/setup.ts"]
