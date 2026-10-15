@@ -32,7 +32,9 @@ export class HttpErrorFilter implements ExceptionFilter {
     const response = http.getResponse<Response>();
     const correlationId = correlationIdOf(http.getRequest<Request>());
 
-    // Wallet inexistente numa submissão é rejeição de negócio: mesmo formato de corpo do 422 de transação.
+    // Wallet inexistente numa submissão é rejeição de negócio: MESMO formato de corpo do 422 de
+    // transação e sem campos voláteis, para o replay devolver exatamente a mesma resposta.
+    // (correlationId segue no header X-Correlation-Id.)
     if (exception instanceof UnknownWalletError) {
       response.status(422).json({
         transactionId: null,
@@ -40,7 +42,6 @@ export class HttpErrorFilter implements ExceptionFilter {
         balance: null,
         failureCode: exception.code,
         idempotentReplay: false,
-        correlationId,
       });
       return;
     }

@@ -130,7 +130,24 @@ describe('POST /wagering/transactions', () => {
     expect(res.body).toMatchObject({ status: 'REJECTED', failureCode: 'WALLET_NOT_FOUND', transactionId: null });
   });
 
+  test.each<[string, number, (w: { id: string; playerId: string }) => Record<string, unknown>]>([
+    ['PROCESSED', 200, (w) => txBody(w)],
+    ['REJECTED', 422, (w) => txBody(w, { money: { amount: '999999.00', currency: 'BRL' } })],
+    ['PENDING_REFERENCE', 202, (w) => txBody(w, { kind: 'ROLLBACK', referenceExternalTransactionId: 'missing' })],
+    ['WALLET_NOT_FOUND', 422, () => txBody({ id: crypto.randomUUID(), playerId: crypto.randomUUID() })],
+  ])('replay devolve o MESMO status HTTP e o mesmo corpo da primeira resposta: %s → %d', async (_label, expected, build) => {
+    const body = build(await createWallet());
+    const first = await submit(body);
+    const replay = await submit(body);
+    expect([first.status, replay.status]).toEqual([expected, expected]);
+    const { idempotentReplay: _a, ...firstRest } = first.body;
+    const { idempotentReplay: _b, ...replayRest } = replay.body;
+    expect(replayRest).toEqual(firstRest);
+  });
+
   test.each([
+    ['valor sem casas decimais ("25")', { money: { amount: '25', currency: 'BRL' } }],
+    ['valor com uma casa ("25.5")', { money: { amount: '25.5', currency: 'BRL' } }],
     ['kind OPENING (interno)', { kind: 'OPENING' }],
     ['REFUND sem referência', { kind: 'REFUND' }],
     ['valor em notação científica', { money: { amount: '1e2', currency: 'BRL' } }],
