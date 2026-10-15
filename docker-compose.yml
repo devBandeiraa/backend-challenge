@@ -1,0 +1,41 @@
+name: wagering
+
+services:
+  postgres:
+    image: postgres:17.11-alpine
+    environment:
+      POSTGRES_USER: wagering
+      POSTGRES_PASSWORD: wagering
+      POSTGRES_DB: wagering
+    # 5442 no host para não colidir com outros Postgres locais (5432–5434 são comuns).
+    ports: ["5442:5432"]
+    # max_connections folgado: 3+ réplicas × pool + processos de teste concorrentes.
+    command: ["postgres", "-c", "max_connections=300", "-c", "deadlock_timeout=200ms"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U wagering -d wagering"]
+      interval: 2s
+      timeout: 3s
+      retries: 30
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  localstack:
+    # 4.14.0 é a última imagem community que não exige LOCALSTACK_AUTH_TOKEN
+    # (as releases 2026.x terminam com exit 55 sem licença). Ver ARCHITECTURE.md.
+    image: localstack/localstack:4.14.0
+    environment:
+      SERVICES: sqs
+      AWS_DEFAULT_REGION: us-east-1
+      SQS_ENDPOINT_STRATEGY: path
+    ports: ["4566:4566"]
+    healthcheck:
+      # "ready" só depois que o init script criou as filas.
+      test: ["CMD-SHELL", "test -f /tmp/queues-ready"]
+      interval: 2s
+      timeout: 3s
+      retries: 60
+    volumes:
+      - ./docker/localstack/init-queues.sh:/etc/localstack/init/ready.d/init-queues.sh:ro
+
+volumes:
+  pgdata:
