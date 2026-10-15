@@ -1,6 +1,7 @@
-import { type ArgumentsHost, Catch, type ExceptionFilter, HttpException, Logger } from '@nestjs/common';
+import { type ArgumentsHost, Catch, type ExceptionFilter, HttpException } from '@nestjs/common';
 import type { Request, Response } from 'express';
 import { ApplicationError, type ErrorCategory, TransientInfrastructureError, UnknownWalletError } from '../../application/errors';
+import type { Logger } from '../../infrastructure/observability/logger';
 import { classifyPgError } from '../../infrastructure/persistence/pg-errors';
 import { correlationIdOf } from './correlation';
 
@@ -25,7 +26,7 @@ const STATUS_BY_CATEGORY: Record<ErrorCategory, number> = {
 
 @Catch()
 export class HttpErrorFilter implements ExceptionFilter {
-  private readonly logger = new Logger('HttpErrorFilter');
+  constructor(private readonly logger: Logger) {}
 
   catch(exception: unknown, host: ArgumentsHost): void {
     const http = host.switchToHttp();
@@ -48,7 +49,8 @@ export class HttpErrorFilter implements ExceptionFilter {
 
     const error = this.normalize(exception);
     if (error.status >= 500) {
-      this.logger.error({ msg: 'request failed', correlationId, code: error.code, err: exception });
+      // correlationId/walletId/... vêm do contexto da requisição (mixin do logger).
+      this.logger.error({ msg: 'request failed', code: error.code, err: exception });
     }
     if (error.status === 503) response.setHeader('Retry-After', '1');
     response.status(error.status).json({

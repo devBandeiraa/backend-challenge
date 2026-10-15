@@ -4,6 +4,7 @@ import { WalletQueries } from '../../application/queries';
 import { ProcessWagerTransactionUseCase, type WagerTransactionOutcome } from '../../application/wagering/process-wager-transaction';
 import { WagerTransactionStatus } from '../../domain/wagering/wager-transaction-kind';
 import { type AppMetrics, METRICS } from '../../infrastructure/observability/metrics';
+import { enrichContext } from '../../infrastructure/observability/context';
 import { correlationIdOf } from './correlation';
 import { idempotencyKeyHeader, parse, submitTransactionBody, text, uuidParam } from './validation';
 
@@ -38,6 +39,7 @@ export class TransactionsController {
     const startedAt = performance.now();
     const key = parse(idempotencyKeyHeader, idempotencyKey, 'Idempotency-Key header');
     const input = parse(submitTransactionBody, body, 'body');
+    enrichContext({ walletId: input.walletId, providerId: input.providerId });
     const correlationId = correlationIdOf(req);
     const outcome = await this.processTransaction.execute({
       ...input,
@@ -45,6 +47,7 @@ export class TransactionsController {
       correlationId,
       causationId: correlationId,
     });
+    enrichContext({ transactionId: outcome.transactionId });
     this.metrics.recordOutcome('http', outcome, startedAt);
     res.status(STATUS_BY_OUTCOME[outcome.status]);
     return present(outcome);

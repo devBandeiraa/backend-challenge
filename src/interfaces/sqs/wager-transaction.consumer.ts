@@ -15,6 +15,7 @@ import type {
 } from '../../application/wagering/process-wager-transaction';
 import { ExponentialBackoff } from '../../domain/messaging/backoff-policy';
 import type { ReceivedMessage, SqsGateway } from '../../infrastructure/messaging/sqs/sqs-gateway';
+import { enrichContext, runWithContext } from '../../infrastructure/observability/context';
 import type { Logger } from '../../infrastructure/observability/logger';
 import type { AppMetrics } from '../../infrastructure/observability/metrics';
 import { wagerMessageData, wagerMessageEnvelope } from '../contracts';
@@ -149,14 +150,21 @@ export class WagerTransactionConsumer {
       return this.deadLetter(message, reason, (error as Error).message);
     }
     const { command, inbound } = parsed;
-    const log = this.logger.child({
-      messageId: inbound.messageId,
-      correlationId: command.correlationId,
-      walletId: command.walletId,
-      providerId: command.providerId,
-      receiveCount: message.receiveCount,
-    });
+    // Escopo de log da mensagem: toda linha emitida daqui em diante (use case, retries da unit
+    // of work, DLQ) carrega messageId/correlationId/walletId/providerId automaticamente.
+    return runWithContext(
+      { messageId: inbound.messageId, correlationId: command.correlationId, walletId: command.walletId, providerId: command.providerId },
+      () => this.process(message, command, inbound, startedAt),
+    );
+  }
 
+  private async process(
+    message: ReceivedMessage,
+    command: SubmitWagerTransactionCommand,
+    inbound: InboundMessage,
+    startedAt: number,
+  ): Promise<Disposition> {
+    const log = this.logger.child({ receiveCount: message.receiveCount });
     let outcome: MessageOutcome;
     const stopHeartbeat = this.startHeartbeat(message, log);
     try {
@@ -169,6 +177,7 @@ export class WagerTransactionConsumer {
       }
     }
     stopHeartbeat();
+    enrichContext({ transactionId: outcome.transactionId });
 
     // Commit feito. Daqui em diante, falhar significa só redelivery (inbox absorve).
     await this.options.hooks?.afterCommit?.(message, outcome);
@@ -181,7 +190,7 @@ export class WagerTransactionConsumer {
     if (outcome.inboxDuplicate) this.metrics.duplicates.inc({ layer: 'inbox' });
     const disposition: Disposition = outcome.inboxDuplicate ? 'duplicate' : 'processed';
     this.metrics.sqsMessages.inc({ outcome: disposition });
-    log.info({ msg: 'message handled', disposition, transactionId: outcome.transactionId, status: outcome.status });
+    log.info({ msg: 'message handled', disposition, status: outcome.status, failureCode: outcome.failureCode });
     return disposition;
   }
 
@@ -220,7 +229,8 @@ export class WagerTransactionConsumer {
     const reason = transient ? 'retries_exhausted' : 'unexpected_error';
     try {
       const failedId = await this.useCase.recordFailure(command, inbound);
-      log.error({ msg: 'giving up on message', reason, transactionId: failedId, err: error });
+      enrichContext({ transactionId: failedId });
+      log.error({ msg: 'giving up on message', reason, err: error });
     } catch (recordError) {
       log.error({ msg: 'could not record FAILED; dead-lettering anyway', reason, err: error, recordError });
     }
