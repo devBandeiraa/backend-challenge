@@ -65,7 +65,8 @@ export function loadConfig(): AppConfig {
       batchSize: num('SQS_BATCH_SIZE', 10),
       shutdownGraceMs: num('SHUTDOWN_GRACE_MS', 10_000),
     },
-    outbox: { intervalMs: num('OUTBOX_INTERVAL_MS', 200), batchSize: num('OUTBOX_BATCH_SIZE', 10) },
+    // Lote 100: com 10 o publisher não acompanhou ~470 eventos/s (docs/load-test-analysis.md).
+    outbox: { intervalMs: num('OUTBOX_INTERVAL_MS', 200), batchSize: num('OUTBOX_BATCH_SIZE', 100) },
     pendingReference: {
       intervalMs: num('PENDING_REFERENCE_INTERVAL_MS', 250),
       batchSize: num('PENDING_REFERENCE_BATCH_SIZE', 20),
