@@ -1023,6 +1023,63 @@ Dependências fixadas em versões publicadas há pelo menos 2 semanas.
     índice de `le_transaction_wallet_uq` (`transaction_id` é a 1ª coluna). Teste junto: SQL puro em
     [schema-constraints.test.ts](test/integration/schema-constraints.test.ts) com BET PROCESSED sem lançamento → `WL006`
     no COMMIT, e LOSS PROCESSED sem lançamento → aceito.
+- **⚠️ Queda do Postgres de mais de ~15 s pode mandar para a DLQ as mensagens SQS em consumo** (2ª reauditoria, N1).
+  - **O problema:** o consumer trata indisponibilidade do banco como qualquer falha transitória e desiste no 5º recebimento
+    ([wager-transaction.consumer.ts](src/interfaces/sqs/wager-transaction.consumer.ts), `receiveCount < maxAttempts`), com
+    backoff de 1 → 2 → 4 → 8 s: cerca de 15 s de janela. Com o Postgres parado, cada tentativa falha em milissegundos (o nome
+    `postgres` nem resolve), então o orçamento acaba durante a queda. A gravação de FAILED também falha (banco fora), e a
+    mensagem vai para a DLQ com `failureReason=retries_exhausted` **sem linha em `wager_transactions`**.
+  - **Evidência (2ª reauditoria, scripts fora do repositório):** quedas de 10, 30 e 90 s com carga HTTP + SQS contínua.
+    - Na de 10 s, 0 mensagens na DLQ; na de 30 s, 1; na de 90 s, 29 (de 3.599 enviadas na execução), todas com `receiveCount 5`.
+    - Outras 95 em execuções de SIGTERM com o banco fora.
+    - Nada foi aplicado pela metade: reconciliação consistente, 0 FAILED. O HTTP no mesmo período só respondeu 503,
+      e o reenvio com a mesma key resolveu.
+    - O e2e "queda do Postgres" ([multi-instance.e2e.ts](test/e2e/multi-instance.e2e.ts)) só envia SQS **depois** da volta,
+      por isso não pega o caso.
+  - **Impacto:** nenhuma invariante quebra, mas a operação aceita pela fila não é aplicada até alguém fazer **redrive** da DLQ
+    para `wager-transactions.fifo`. O redrive é seguro: a inbox e a idempotency key deduplicam o que já tiver sido processado.
+  - **Correção proposta (não implementada nesta versão):**
+    1. pausar o `ReceiveMessage` enquanto o banco estiver fora, usando a mesma checagem do readiness;
+    2. não contar falhas `unavailable` no limite de tentativas: devolver a mensagem com atraso crescente até o teto de 60 s.
+       O limite e o FAILED continuam valendo para erro não classificado.
+    3. Junto, subir o `maxReceiveCount` do redrive
+       ([provision-queues.ts](src/infrastructure/messaging/sqs/provision-queues.ts)), que hoje moveria a mensagem no 6º
+       recebimento de qualquer jeito.
+    4. Teste: no e2e de queda, enviar SQS durante a queda e exigir 0 mensagens na DLQ.
+- **⚠️ O shutdown com tráfego às vezes só termina pelo timer de grace (~60 s, exit 0)** (2ª reauditoria, N2).
+  - **O problema:**
+    - Em parte dos SIGTERMs com tráfego, a sequência de shutdown do Nest não chega ao re-raise do sinal. O consumer e os
+      workers param em menos de 2 s (`background processes stopped`) e o pool do ORM fecha, mas o processo fica parado.
+    - Ele só sai quando o `Bun.sleep(shutdownGraceMs)` do `stop()` do consumer (`Promise.race`, nunca cancelado) esvazia
+      o event loop: ~60 s depois, com código **0** em vez de 143.
+    - Não foi isolada qual promessa fica pendente.
+  - **Evidência (2ª reauditoria):**
+    - 7 de 12 `docker stop` com tráfego levaram 60,5–60,7 s e saíram com 0, inclusive com o Postgres no ar (SIGTERM durante
+      o envio de 300 mensagens). Os outros 5, e todos sem tráfego, saíram em 0,8–7,6 s com 143.
+    - Durante a espera, a réplica não tinha sessão no Postgres (pool já fechado).
+    - O Bun 1.4.2 respeita o re-raise depois de remover o listener (exit 143 num script isolado), então o re-raise não é
+      engolido: ele não é alcançado.
+    - O e2e de SIGTERM passa porque mede uma réplica ociosa ou `docker kill`.
+  - **Impacto:**
+    - Nenhum nos dados: as mensagens recebidas são devolvidas e processadas por outra réplica em milissegundos.
+    - Sem SIGKILL: 60 s < `stop_grace_period` de 75 s.
+    - Mas cada réplica leva 60 s para sair num deploy, o código 0 esconde o problema, e um `SHUTDOWN_GRACE_MS` ≥ 75 s viraria SIGKILL.
+  - **Correção proposta (não implementada nesta versão):**
+    1. `clearTimeout` do timer de grace quando o loop do consumer termina;
+    2. log por fase do shutdown (consumer, workers, HTTP fechado, ORM fechado), para mostrar onde ele para;
+    3. teto duro de shutdown que loga a fase pendente e sai com código ≠ 0;
+    4. teste: SIGTERM com tráfego HTTP e SQS no instante do sinal, exigindo 143 em poucos segundos.
+- **`docker stop` de uma réplica gera 502 por até ~5 s** (2ª reauditoria, N3).
+  - **O problema:** `proxy_next_upstream off` ([nginx.conf](docker/nginx.conf)) desliga também o failover de erro de **conexão**,
+    em que a requisição nem chegou à réplica. Com `resolver … valid=5s`, o nginx continua mandando para a réplica parada até
+    o DNS do compose expirar.
+  - **Evidência (2ª reauditoria):** 20× 502 numa parada planejada (`docker stop`) de uma réplica, com o Postgres no ar e carga
+    pelo nginx.
+  - **Impacto:** o provedor reenvia com a mesma key e nada se perde (§8), mas todo deploy gera 502. Esses 502 não são
+    "a réplica caiu no meio da requisição": a requisição nunca chegou à aplicação.
+  - **Correção proposta (não implementada nesta versão):** `proxy_next_upstream error timeout;` **sem** `non_idempotent`.
+    O nginx só repassa um POST a outra réplica quando ele ainda não foi enviado, então o reenvio é seguro. Opcionalmente,
+    readiness 503 assim que chega o SIGTERM, antes de fechar o servidor HTTP.
 - **Hot wallet:** as transações em espera de lock seguram conexões do pool (seção 13). Mitigações
   candidatas, com custo: fila por walletId em cada instância; rotear hot wallets pela FIFO; `lock_timeout`
   curto só para o lock da wallet.

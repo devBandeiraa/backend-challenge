@@ -21,7 +21,7 @@ Stack: Bun · TypeScript strict · NestJS · PostgreSQL + MikroORM · SQS (Local
 ```bash
 bun install
 bun run infra:up        # Postgres + emulador SQS + migrations + filas
-bun run test            # unidade + integração + concorrência + recuperação (~1–2 min)
+bun run test            # unidade + integração + concorrência + recuperação (~2,5 min)
 bun run test:multi      # ≥ 3 instâncias reais atrás do nginx (sobe e desliga as réplicas)
 ```
 
