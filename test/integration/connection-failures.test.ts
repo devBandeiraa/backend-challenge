@@ -263,7 +263,11 @@ describe('erro de conexão SEM SQLSTATE ("not queryable") entre instruções', (
     }, 20_000, 100);
     expect(row.status).toBe('PROCESSED');
     expect(state.rawErrors.some((m) => NOT_QUERYABLE.test(m))).toBe(true);
-    const outcomes = Object.fromEntries((await metrics.sqsMessages.get()).values.map((v) => [v.labels.outcome, v.value]));
+    // o consumer registra o desfecho DEPOIS do commit e do ack: a linha PROCESSED aparece no banco antes da métrica
+    const outcomes = await waitFor(async () => {
+      const values = Object.fromEntries((await metrics.sqsMessages.get()).values.map((v) => [v.labels.outcome, v.value]));
+      return values.processed === 1 ? values : undefined;
+    }, 5_000, 20);
     expect(outcomes).toEqual({ retry: 1, processed: 1 });
     expect((await metrics.dlq.get()).values).toEqual([]);
     expect(await walletBalance(app.orm, w.id)).toBe('90.00');
