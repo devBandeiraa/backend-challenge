@@ -278,3 +278,89 @@ describe('SQS consumido por 3 consumers concorrentes', () => {
     }, 90_000, 1_000);
   }, 180_000);
 });
+
+/** Executa um comando docker e devolve a saída (stdout) como texto. */
+const sh = (cmd: string[]) => new TextDecoder().decode(Bun.spawnSync(cmd).stdout).trim();
+const replicaIds = () => sh(['docker', 'compose', 'ps', '-q', 'app']).split('\n').filter(Boolean);
+/** /health/ready de CADA réplica, direto no container (o nginx esconderia uma réplica travada). */
+const readyByReplica = () =>
+  replicaIds().map((id) => {
+    const out = Bun.spawnSync(['docker', 'exec', id, 'wget', '-qO-', '-T', '3', 'http://localhost:3000/health/ready']);
+    return { id, ready: out.exitCode === 0 && new TextDecoder().decode(out.stdout).includes('"status":"ok"') };
+  });
+
+// Por último no arquivo: derruba o Postgres do stack.
+describe('queda do Postgres (30 s) com carga', () => {
+  /** Prazo para as 3 réplicas voltarem a ready sozinhas depois que o Postgres fica healthy. */
+  const RECOVERY_DEADLINE_MS = 60_000;
+
+  test('as 3 réplicas voltam a ready sozinhas, sem 5xx depois disso, e a invariante bate', async () => {
+    expect(readyByReplica().every((r) => r.ready)).toBe(true);
+    const wallets = await Promise.all(Array.from({ length: 10 }, () => createWallet('1000.00')));
+
+    // carga contínua pelo nginx durante toda a queda (cada requisição com a própria key)
+    let loading = true;
+    const sent: { body: ReturnType<typeof tx>; status: number }[] = [];
+    const load = Promise.all(
+      Array.from({ length: 10 }, async (_, i) => {
+        while (loading) {
+          const body = tx(wallets[i]!, { money: { amount: '1.00', currency: 'BRL' } });
+          const res = await submit(body).catch(() => ({ status: -1 }) as { status: number });
+          sent.push({ body, status: res.status });
+          await Bun.sleep(100);
+        }
+      }),
+    );
+    await Bun.sleep(2_000);
+    expect(Bun.spawnSync(['docker', 'compose', 'stop', '-t', '0', 'postgres']).exitCode).toBe(0);
+    await Bun.sleep(30_000);
+    expect(Bun.spawnSync(['docker', 'compose', 'start', 'postgres']).exitCode).toBe(0);
+    await waitFor(async () => (sh(['docker', 'inspect', '-f', '{{.State.Health.Status}}', sh(['docker', 'compose', 'ps', '-q', 'postgres'])]) === 'healthy') || undefined, 60_000, 500);
+    const healthyAt = performance.now();
+
+    // as 3 réplicas voltam a ready SEM reinício (mesmo container, mesmo processo)
+    const before = new Map(replicaIds().map((id) => [id, sh(['docker', 'inspect', '-f', '{{.State.StartedAt}}', id])]));
+    await waitFor(async () => readyByReplica().every((r) => r.ready) || undefined, RECOVERY_DEADLINE_MS, 1_000);
+    const recoveredMs = Math.round(performance.now() - healthyAt);
+    for (const [id, startedAt] of before) expect(sh(['docker', 'inspect', '-f', '{{.State.StartedAt}}', id])).toBe(startedAt);
+    loading = false;
+    await load;
+
+    // depois da recuperação: nenhuma resposta 5xx, nas 3 réplicas
+    const after = await burst(60, (i) => submit(tx(wallets[i % 10]!, { money: { amount: '1.00', currency: 'BRL' } })));
+    expect(after.filter((r) => r.status >= 500)).toEqual([]);
+    expect(after.every((r) => r.status === 200)).toBe(true);
+    expect(new Set(after.map((r) => r.instance)).size).toBeGreaterThanOrEqual(3);
+
+    // o consumer de cada réplica também voltou: mensagens novas são processadas
+    const keys: string[] = [];
+    for (const w of wallets) {
+      const body = { ...tx(w, { money: { amount: '1.00', currency: 'BRL' } }), idempotencyKey: '' };
+      body.idempotencyKey = `${body.providerId}:${body.externalTransactionId}`;
+      keys.push(body.idempotencyKey);
+      await gateway.sendToInput(wagerMessage(body).body, w.id, crypto.randomUUID());
+    }
+    await waitFor(async () => {
+      const [row] = await orm.em.fork().execute<{ n: string }[]>(
+        `SELECT count(*)::text AS n FROM wager_transactions WHERE idempotency_key = ANY(?::text[]) AND status = 'PROCESSED'`,
+        [`{${keys.map((k) => `"${k}"`).join(',')}}`],
+      );
+      return Number(row?.n) === keys.length || undefined;
+    }, 30_000, 500);
+
+    // o que a carga recebeu sem resposta definitiva é reenviado com a MESMA key (como faria o provedor)
+    const unresolved = sent.filter((s) => ![200, 422].includes(s.status));
+    for (const s of unresolved) {
+      const res = await submit(s.body);
+      expect(res.status).toBe(200);
+    }
+    // cada BET aceita debitou exatamente uma vez: saldo = 1000 − nº de BETs PROCESSED; ledger bate (afterEach)
+    for (const w of wallets) {
+      const processed = await countRows(orm, `wager_transactions WHERE wallet_id = ? AND kind = 'BET' AND status = 'PROCESSED'`, [w.id]);
+      const debits = await countRows(orm, `wallet_ledger_entries WHERE wallet_id = ? AND direction = 'DEBIT'`, [w.id]);
+      expect(debits).toBe(processed);
+      expect(await walletBalance(orm, w.id)).toBe((1000 - processed).toFixed(2));
+    }
+    console.log(JSON.stringify({ postgresOutage: { requestsDuringLoad: sent.length, unresolvedResent: unresolved.length, recoveredMs, statuses: Object.fromEntries([...new Set(sent.map((s) => s.status))].map((st) => [st, sent.filter((s) => s.status === st).length])) } }));
+  }, 240_000);
+});

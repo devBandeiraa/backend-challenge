@@ -116,6 +116,7 @@ Todos os testes usam **Postgres e LocalStack reais**. "e2e" = `bun run test:mult
 | Reconciliação: loga, mede e sinaliza sem corrigir (9) | [reconcile-wallet.ts](src/application/wallets/reconcile-wallet.ts) | [reconciliation.test.ts](test/integration/reconciliation.test.ts) (divergência forçada com `session_replication_role = replica`) |
 | Health live/ready abertos; ready = Postgres + SQS, 503 com o detalhe por dependência (9, 12) | [health.controller.ts](src/interfaces/http/health.controller.ts) | [observability.test.ts](test/integration/observability.test.ts) (fila apagada → `{"sqs":"down"}`), [http-api.test.ts](test/integration/http-api.test.ts) |
 | Consumer: mesmo use case, inbox, ack após commit, negócio/transitório/permanente, limite → DLQ, SIGTERM, redelivery (10) | [wager-transaction.consumer.ts](src/interfaces/sqs/wager-transaction.consumer.ts) | [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts), [crash-after-commit.test.ts](test/concurrency/crash-after-commit.test.ts), e2e (SIGTERM) |
+| Queda do Postgres: réplicas voltam a ready sozinhas, sem 5xx depois (3, 13) | pool com timeouts, watchdog de query, ROLLBACK no-op em cliente quebrado, readiness com timeout (§5.4) | e2e "queda do Postgres (30 s) com carga" em [multi-instance.e2e.ts](test/e2e/multi-instance.e2e.ts) |
 | Instrução travada não segura a mensagem nem o grupo FIFO (10) | `statement_timeout` por transação (> 2 × `lock_timeout`) + teto do heartbeat | [transient-failures.test.ts](test/integration/transient-failures.test.ts) ("statement_timeout"), [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts) ("teto do heartbeat"), [consumer-timing.test.ts](test/unit/infrastructure/consumer-timing.test.ts) |
 | Atomicidade inbox + transação + wallet + ledger + outbox (6.5, 11) | um único `uow.run` por submissão | [atomicity.test.ts](test/integration/atomicity.test.ts): falha injetada DEPOIS de todas as escritas (HTTP e SQS) → nada persiste |
 | Outbox: publishers concorrentes; cenário de 5 passos com processos reais (11) | [outbox-publisher.ts](src/infrastructure/workers/outbox-publisher.ts) | [outbox-crash.test.ts](test/recovery/outbox-crash.test.ts): processo morto com SIGKILL antes de publicar (segurando as linhas) e depois do SendMessage; OUTRO processo publica; cada evento chega uma vez · [outbox-publisher.test.ts](test/integration/outbox-publisher.test.ts) (2 publishers) · [restart-consistency.test.ts](test/recovery/restart-consistency.test.ts) |
@@ -412,6 +413,46 @@ ainda o usar. Tabela nova numa migration futura precisa de `GRANT` explícito.
 - **Classificação de erros:** por SQLSTATE e nome de constraint, nunca por mensagem ([pg-errors.ts](src/infrastructure/persistence/pg-errors.ts)).
 - **Ids:** UUIDv7 (`Bun.randomUUIDv7`): ordenáveis por tempo e sem coordenação entre instâncias.
 
+### 5.4 Queda do Postgres: o pool se recupera sozinho
+**O problema (reauditoria da v1.0.0, achado A1).** Com o Postgres parado por 30 s sob carga, réplicas ficavam
+travadas **para sempre** depois que ele voltava: readiness sem resposta, consumer e workers parados, liveness verde
+(ninguém reiniciava). Reproduzido isoladamente, a causa tem duas partes:
+1. **Vazamento de conexão no Kysely** (usado pelo MikroORM 7): `ControlledTransaction.rollback()` só devolve a conexão
+   ao pool **depois** de um ROLLBACK bem-sucedido, e um BEGIN que falha também não a devolve. Num cliente cuja conexão
+   caiu, o ROLLBACK falha ("Client has encountered a connection error and is not queryable"), e cada falha vazava
+   uma vaga. Com 10 vazamentos (o pool inteiro), a réplica não conseguia mais nenhuma conexão.
+2. **Nada limitava a espera no cliente:** sem `connectionTimeoutMillis`, quem pedia uma vaga esperava para sempre;
+   uma query enviada logo antes de o servidor sumir esperava a resposta para sempre (o `statement_timeout` é do
+   servidor).
+
+**A correção** ([pg-pool-resilience.ts](src/infrastructure/persistence/pg-pool-resilience.ts), aplicada em
+`buildOrmConfig` para a app, os testes e as ferramentas):
+- **ROLLBACK/BEGIN em cliente quebrado viram no-op bem-sucedido.** O servidor já desfez a transação quando a conexão
+  caiu; o Kysely então devolve o cliente, e o `pg-pool` o descarta porque ele não é "queryable". **COMMIT nunca é
+  simulado.**
+- **`connectionTimeoutMillis`** (`DB_CONNECT_TIMEOUT_MS`, 5 s): teto para abrir conexão e para esperar vaga. Falha
+  rápida, que vira 503 / retry SQS.
+- **Watchdog de query** (`DB_QUERY_TIMEOUT_MS`, padrão `statement_timeout` + 3 s = 18 s): query sem resposta além
+  disso **destrói a conexão**, então ela rejeita com erro de conexão (transitório) e o pool descarta o cliente. O
+  `query_timeout` nativo do `pg` não serve: ele rejeita a query mas mantém o cliente preso e o pool o reaproveita.
+  Fica acima do `statement_timeout` para que uma instrução só lenta termine pelo servidor (`57014`).
+- **Isenção do lock da wallet**, a mesma do `statement_timeout` (§7.3): a instrução marcada com `LOCK_WAIT_MARKER` não
+  tem watchdog, porque a fila de uma hot wallet é espera legítima no servidor vivo. Servidor morto embaixo dela é
+  detectado pelo **keepalive de TCP** (`keepAlive` no pool; no compose, `sysctls` de 5 s × 3 sondas, em vez de
+  75 s × 9 do Linux).
+- **Handler de `'error'`** em clientes ociosos e emprestados: a conexão que cai é registrada (`database connection
+  error; client discarded`) e descartada; sem listener, o evento derrubaria o processo.
+- **Readiness com timeout de 1 s** na checagem do Postgres: com o banco fora (ou o pool esgotado), responde **503**
+  com `{"postgres":"down"}` em vez de travar.
+- **`application_name`** por réplica (`wagering-app:<instância>`): aparece em `pg_stat_activity` e é usado pelo guard
+  dos testes do host.
+
+**Prova:** e2e "queda do Postgres (30 s) com carga" em [multi-instance.e2e.ts](test/e2e/multi-instance.e2e.ts): o
+Postgres é parado com `docker compose stop -t 0` durante a carga e religado. As 3 réplicas voltam a ready **sem
+reinício** (mesmo `StartedAt`) em até 60 s depois de ele ficar healthy; depois disso, 60 requisições nas 3 réplicas
+dão 200 (nenhum 5xx); mensagens SQS novas são processadas; o que a carga recebeu sem resposta definitiva é reenviado
+com a mesma key; cada BET PROCESSED debitou uma vez e a invariante bate.
+
 ---
 
 ## 6. Idempotência
@@ -505,8 +546,12 @@ ainda o usar. Tabela nova numa migration futura precisa de `GRANT` explícito.
     volta logo depois dela. O que segura uma mensagem é limitado pelo **teto do heartbeat**, não pela fila.
   - Pior caso = o maior de dois caminhos, mais o backoff entre tentativas:
     - lock: (tentativas + 1 da gravação do FAILED) × `lock_timeout`;
-    - instrução travada: (tentativas − 1) × `lock_timeout` + 2 × `statement_timeout` (a que estoura e a do FAILED).
-  - Com os defaults: max(6 × 5 s, 4 × 5 s + 2 × 15 s) + 150 ms = 50,15 s, o que exige ≥ 76 s. Por isso o padrão é **90 s**.
+    - instrução travada ou sem resposta: (tentativas − 1) × `lock_timeout` + watchdog de query (`DB_QUERY_TIMEOUT_MS`,
+      §5.4, maior que o `statement_timeout`) + `statement_timeout` (a gravação do FAILED).
+  - Com os defaults: max(6 × 5 s, 4 × 5 s + 18 s + 15 s) + 150 ms = 53,15 s, o que exige ≥ 80 s. Por isso o padrão é **90 s**.
+  - **Fora da conta:** a espera por uma vaga no pool da própria réplica (até `DB_CONNECT_TIMEOUT_MS` por tentativa,
+    só quando a réplica está saturada) e a soma das esperas do lock isento da wallet. As duas são limitadas pelo teto
+    do heartbeat abaixo; uma entrega que passe dele volta à fila e é deduplicada pela inbox.
   - **Teto do heartbeat:** o heartbeat renova a visibilidade só até 1,5 × pior caso (cerca de 75 s). Depois disso a
     mensagem volta à fila em vez de segurar o grupo FIFO da wallet para sempre; a nova entrega é deduplicada pela
     inbox. Prova: "teto do heartbeat" em [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts) e
@@ -555,8 +600,8 @@ ainda o usar. Tabela nova numa migration futura precisa de `GRANT` explícito.
 | Prazo | Valor | Regra |
 |---|---|---|
 | long poll (`SQS_WAIT_TIME_SECONDS`) | 5 s | — |
-| pior caso de processamento | 50,15 s | §7.3 |
-| `SHUTDOWN_GRACE_MS` | **60 s** | ≥ long poll + pior caso = 5 + 50,15 = 55,15 s. **A instância não sobe** se for menor; sem a variável, o padrão é exatamente esse mínimo |
+| pior caso de processamento | 53,15 s | §7.3 |
+| `SHUTDOWN_GRACE_MS` | **60 s** | ≥ long poll + pior caso = 5 + 53,15 = 58,15 s. **A instância não sobe** se for menor; sem a variável, o padrão é exatamente esse mínimo |
 | `stop_grace_period` | **75 s** | > `SHUTDOWN_GRACE_MS` + 15 s para os workers terminarem o tick corrente (cada instrução limitada pelo `statement_timeout` de 15 s) e o Nest fechar o pool, antes do SIGKILL |
 
 No compose também: `init: true` (tini como PID 1, porque o Nest re-emite o sinal após o shutdown).

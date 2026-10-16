@@ -18,11 +18,11 @@ export function ensureMigrated(): Promise<void> {
 
 export async function createTestOrm(poolMax = 20): Promise<MikroORM> {
   await ensureMigrated();
-  return MikroORM.init(buildOrmConfig({ clientUrl: TEST_DATABASE_URL, poolMax }));
+  return MikroORM.init(buildOrmConfig({ clientUrl: TEST_DATABASE_URL, poolMax, applicationName: 'wagering-test' }));
 }
 
 /** ORM com a identidade do owner (schema tests com SQL puro, divergência forçada). */
 export async function createOwnerOrm(poolMax = 5): Promise<MikroORM> {
   await ensureMigrated();
-  return MikroORM.init(buildOrmConfig({ clientUrl: TEST_OWNER_DATABASE_URL, poolMax }));
+  return MikroORM.init(buildOrmConfig({ clientUrl: TEST_OWNER_DATABASE_URL, poolMax, applicationName: 'wagering-test-owner' }));
 }

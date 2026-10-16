@@ -9,7 +9,17 @@ export interface AppConfig {
   instanceId: string;
   port: number;
   roles: Set<AppRole>;
-  db: { url: string; poolMax: number; lockTimeoutMs: number; statementTimeoutMs: number; uowMaxAttempts: number };
+  db: {
+    url: string;
+    poolMax: number;
+    lockTimeoutMs: number;
+    statementTimeoutMs: number;
+    /** Watchdog do cliente: query sem resposta além disso destrói a conexão (pg-pool-resilience.ts). */
+    queryTimeoutMs: number;
+    /** Teto para abrir conexão e para esperar vaga no pool. */
+    connectTimeoutMs: number;
+    uowMaxAttempts: number;
+  };
   sqs: {
     endpoint: string;
     inputQueue: string;
@@ -56,9 +66,17 @@ export function loadConfig(): AppConfig {
     );
   }
 
+  // Watchdog do cliente (queda do servidor, socket meio-aberto): acima do statement_timeout, para que uma
+  // instrução lenta termine pelo servidor (57014); só a query SEM resposta (servidor sumiu) ou o lock isento
+  // da wallet chegam a ele. Dá teto rígido também à instrução isenta.
+  const queryTimeoutMs = num('DB_QUERY_TIMEOUT_MS', statementTimeoutMs + 3_000);
+  if (queryTimeoutMs <= statementTimeoutMs) {
+    throw new Error(`DB_QUERY_TIMEOUT_MS (${queryTimeoutMs}) must be greater than DB_STATEMENT_TIMEOUT_MS (${statementTimeoutMs})`);
+  }
+  const connectTimeoutMs = num('DB_CONNECT_TIMEOUT_MS', 5_000);
   const uowMaxAttempts = num('UOW_MAX_ATTEMPTS', 5);
   const waitTimeSeconds = num('SQS_WAIT_TIME_SECONDS', 10);
-  const timing = { lockTimeoutMs, statementTimeoutMs, uowMaxAttempts };
+  const timing = { lockTimeoutMs, statementTimeoutMs, queryTimeoutMs, uowMaxAttempts };
 
   return {
     instanceId: process.env.INSTANCE_ID ?? hostname(),
@@ -72,6 +90,8 @@ export function loadConfig(): AppConfig {
       // Teto de qualquer instrução (query travada, rede meio-aberta): sem ele, o heartbeat do consumer
       // seguraria a mensagem (e o grupo FIFO da wallet) indefinidamente.
       statementTimeoutMs,
+      queryTimeoutMs,
+      connectTimeoutMs,
       uowMaxAttempts,
     },
     sqs: {
@@ -99,6 +119,10 @@ export function loadConfig(): AppConfig {
   };
 }
 
+export type ConsumerTimingDb = Pick<AppConfig['db'], 'uowMaxAttempts' | 'lockTimeoutMs' | 'statementTimeoutMs'> & {
+  queryTimeoutMs?: number;
+};
+
 /** Backoff da unit of work entre tentativas (teto do ExponentialBackoff de mikro-orm-unit-of-work). */
 const UOW_BACKOFF = { baseMs: 10, factor: 2, maxMs: 200 };
 
@@ -106,24 +130,29 @@ const UOW_BACKOFF = { baseMs: 10, factor: 2, maxMs: 200 };
  * Pior caso de processamento de UMA entrega, o maior de dois caminhos:
  *  (a) lock: toda tentativa da unit of work para no lock_timeout (55P03, refeita) e a gravação do
  *      FAILED espera mais um lock_timeout: (tentativas + 1) × lock_timeout + backoff;
- *  (b) instrução lenta: as tentativas anteriores param no lock e uma instrução estoura o
- *      statement_timeout (57014, NÃO refeita na mesma entrega); a gravação do FAILED também é
- *      limitada por ele: (tentativas − 1) × lock_timeout + 2 × statement_timeout + backoff.
+ *  (b) instrução lenta ou sem resposta: as tentativas anteriores param no lock e uma instrução termina no
+ *      statement_timeout (57014) ou, se o servidor sumiu, no watchdog do cliente (DB_QUERY_TIMEOUT_MS, maior);
+ *      nenhum dos dois é refeito na mesma entrega, e a gravação do FAILED é limitada pelo statement_timeout:
+ *      (tentativas − 1) × lock_timeout + query_timeout + statement_timeout + backoff.
+ * A instrução do lock da wallet é isenta do statement_timeout e do watchdog (fila legítima de hot wallet):
+ * cada espera dela é limitada pelo lock_timeout, a soma não. O que limita uma mensagem presa nela é o teto
+ * do heartbeat; servidor morto embaixo dela é detectado pelo keepalive de TCP.
  * Cada tentativa é dominada por UMA espera longa; o tempo das demais instruções (ms) é desprezível.
  * O mesmo valor (× fator) é o teto de renovações do heartbeat do consumer.
  */
-export function worstCaseMessageProcessingMs(db: Pick<AppConfig['db'], 'uowMaxAttempts' | 'lockTimeoutMs' | 'statementTimeoutMs'>): number {
+export function worstCaseMessageProcessingMs(db: ConsumerTimingDb): number {
   let backoff = 0;
   for (let n = 1; n < db.uowMaxAttempts; n++) {
     backoff += Math.min(UOW_BACKOFF.maxMs, UOW_BACKOFF.baseMs * UOW_BACKOFF.factor ** (n - 1));
   }
   const lockPath = (db.uowMaxAttempts + 1) * db.lockTimeoutMs + backoff;
-  const statementPath = (db.uowMaxAttempts - 1) * db.lockTimeoutMs + 2 * db.statementTimeoutMs + backoff;
+  const queryTimeoutMs = Math.max(db.statementTimeoutMs, db.queryTimeoutMs ?? 0);
+  const statementPath = (db.uowMaxAttempts - 1) * db.lockTimeoutMs + queryTimeoutMs + db.statementTimeoutMs + backoff;
   return Math.max(lockPath, statementPath);
 }
 
 /** Teto do heartbeat: depois dele a visibilidade expira e a mensagem volta (inbox e key tornam isso seguro). */
-export function maxMessageProcessingMs(db: Pick<AppConfig['db'], 'uowMaxAttempts' | 'lockTimeoutMs' | 'statementTimeoutMs'>): number {
+export function maxMessageProcessingMs(db: ConsumerTimingDb): number {
   return Math.ceil(worstCaseMessageProcessingMs(db) * VISIBILITY_SAFETY_FACTOR);
 }
 
@@ -132,10 +161,10 @@ export const VISIBILITY_SAFETY_FACTOR = 1.5;
 /**
  * Prazo de shutdown do consumer: o long poll em andamento termina em até waitTimeSeconds (não é
  * abortado) e cada mensagem já em processamento leva até o pior caso. As que o poll trouxer depois do
- * SIGTERM são devolvidas na hora. Com os defaults do compose: 5 s + 50,15 s = 55,15 s.
+ * SIGTERM são devolvidas na hora. Com os defaults do compose: 5 s + 53,15 s = 58,15 s.
  */
 export function requiredShutdownGraceMs(
-  db: Pick<AppConfig['db'], 'uowMaxAttempts' | 'lockTimeoutMs' | 'statementTimeoutMs'>,
+  db: ConsumerTimingDb,
   waitTimeSeconds: number,
 ): number {
   return Math.ceil(waitTimeSeconds * 1_000 + worstCaseMessageProcessingMs(db));

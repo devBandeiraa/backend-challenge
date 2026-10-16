@@ -133,6 +133,8 @@ Lida na subida da instância; os defaults servem para rodar no host.
 | `DB_POOL_MAX` | 10 | conexões por instância |
 | `DB_LOCK_TIMEOUT_MS` | 5000 | teto de espera por lock em cada transação |
 | `DB_STATEMENT_TIMEOUT_MS` | 15000 | teto de cada instrução SQL (proteção contra instrução travada); precisa ser maior que 2 × `DB_LOCK_TIMEOUT_MS` (**a instância não sobe** se não for) |
+| `DB_QUERY_TIMEOUT_MS` | `DB_STATEMENT_TIMEOUT_MS` + 3000 | watchdog do cliente: query **sem resposta** além disso destrói a conexão, que o pool descarta (queda do Postgres); precisa ser maior que `DB_STATEMENT_TIMEOUT_MS` (**a instância não sobe** se não for) |
+| `DB_CONNECT_TIMEOUT_MS` | 5000 | teto para abrir conexão e para esperar vaga no pool; estourado, a requisição recebe 503 |
 | `UOW_MAX_ATTEMPTS` | 5 | tentativas da transação em conflito de concorrência |
 | `APP_ROLES` | `http,consumer,outbox,pending-reference` | papéis desta instância |
 | `SQS_ENDPOINT` | `http://localhost:4566` | emulador SQS |

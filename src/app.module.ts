@@ -31,6 +31,8 @@ import { WalletsController } from './interfaces/http/wallets.controller';
 import { WagerTransactionConsumer } from './interfaces/sqs/wager-transaction.consumer';
 
 export const LOGGER = Symbol('Logger');
+/** application_name das réplicas no Postgres (o guard dos testes do host procura por ele). */
+export const APP_APPLICATION_NAME_PREFIX = 'wagering-app:';
 export const NEST_LOGGER = Symbol('NestLogger');
 const PENDING_POLICY = Symbol('PendingReferencePolicy');
 
@@ -171,8 +173,17 @@ const messaging = [
   imports: [
     MikroOrmModule.forRootAsync({
       useFactory: () => {
-        const { db } = loadConfig();
-        return buildOrmConfig({ clientUrl: db.url, poolMax: db.poolMax });
+        const { db, instanceId } = loadConfig();
+        // Conexão que cai (ociosa ou em uso) é descartada pelo pool; aqui só fica registrada.
+        const poolLogger = createLogger({ instanceId, component: 'db-pool' });
+        return buildOrmConfig({
+          clientUrl: db.url,
+          poolMax: db.poolMax,
+          connectTimeoutMs: db.connectTimeoutMs,
+          queryTimeoutMs: db.queryTimeoutMs,
+          applicationName: `${APP_APPLICATION_NAME_PREFIX}${instanceId}`.slice(0, 63),
+          onConnectionError: (error, state) => poolLogger.warn({ msg: 'database connection error; client discarded', state, err: error }),
+        });
       },
     }),
   ],

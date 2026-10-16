@@ -28,6 +28,7 @@ import {
   toWallet,
 } from './mappers';
 import { isUniqueViolation } from './pg-errors';
+import { LOCK_WAIT_MARKER } from './pg-pool-resilience';
 import { InboxRecord, LedgerEntryRecord, OutboxRecord, WagerTransactionRecord, WalletRecord } from './schemas';
 
 // Escritas nativas (insert/nativeUpdate), sem flush do Unit of Work: a ordem dos comandos
@@ -62,7 +63,7 @@ class MikroOrmWalletRepository implements WalletRepository {
     // instruções seguem com o teto, que volta logo depois (só em sucesso: em erro a transação aborta).
     await this.em.execute(`SELECT set_config('statement_timeout', '0', true)`);
     // FOR NO KEY UPDATE e não LockMode.PESSIMISTIC_WRITE (FOR UPDATE): ver decisão A.
-    const rows = await this.em.execute(`SELECT * FROM wallets WHERE id = ? FOR NO KEY UPDATE`, [id]);
+    const rows = await this.em.execute(`${LOCK_WAIT_MARKER} SELECT * FROM wallets WHERE id = ? FOR NO KEY UPDATE`, [id]);
     await this.em.execute(
       `SELECT set_config('statement_timeout', coalesce(current_setting('wagering.statement_timeout', true), '0'), true)`,
     );

@@ -12,7 +12,7 @@ export async function migrate(
   ownerUrl: string = migrationDatabaseUrl(),
   appUrl: string = appDatabaseUrl(),
 ): Promise<void> {
-  const orm = await MikroORM.init(buildOrmConfig({ clientUrl: ownerUrl, poolMax: 2 }));
+  const orm = await MikroORM.init(buildOrmConfig({ clientUrl: ownerUrl, poolMax: 2, queryTimeoutMs: 0, applicationName: 'wagering-migrate' }));
   try {
     if (command === 'up' || command === 'reset') {
       if (command === 'reset') await orm.migrator.down({ to: 0 });

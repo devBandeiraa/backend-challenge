@@ -94,16 +94,22 @@ services:
       # Cada réplica tem seu próprio pool, consumer SQS, publisher da outbox e worker de referências.
       DB_POOL_MAX: "10"
       SQS_WAIT_TIME_SECONDS: "5"
-      # >= long poll (5 s) + pior caso de processamento (50,15 s): a instância não sobe se for menor.
+      # >= long poll (5 s) + pior caso de processamento (53,15 s): a instância não sobe se for menor.
       SHUTDOWN_GRACE_MS: "60000"
       # Lote maior por transação: com lote 10 o publisher não acompanhou ~470 eventos/s (lag de 19s no test:load).
       OUTBOX_BATCH_SIZE: "100"
     deploy:
       replicas: 3
+    # Keepalive de TCP curto: detecta Postgres morto embaixo de uma conexão em espera (a instrução do lock da
+    # wallet é isenta do watchdog de query). Padrão do Linux: 75 s × 9 sondas, mais de 11 min.
+    # Detecção: 10 s (keepAliveInitialDelayMillis no pool) + 3 × 5 s.
+    sysctls:
+      net.ipv4.tcp_keepalive_intvl: 5
+      net.ipv4.tcp_keepalive_probes: 3
     # tini como PID 1: o SIGTERM chega à app, e o re-raise do sinal pelo Nest após o
     # shutdown encerra o processo (PID 1 ignora sinais sem handler).
     init: true
-    # stop_grace_period (75 s) > SHUTDOWN_GRACE_MS (60 s) >= long poll (5 s) + pior caso (50,15 s).
+    # stop_grace_period (75 s) > SHUTDOWN_GRACE_MS (60 s) >= long poll (5 s) + pior caso (53,15 s).
     # Os 15 s restantes cobrem os workers terminarem o tick corrente (limitado pelo statement_timeout)
     # e o Nest fechar o pool, antes do SIGKILL. Ver ARCHITECTURE.md §7.6.
     stop_grace_period: 75s

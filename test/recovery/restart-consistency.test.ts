@@ -29,11 +29,13 @@ function startService(): Subprocess {
       SQS_DLQ: names.deadLetter,
       SQS_EVENTS_QUEUE: names.events,
       SQS_WAIT_TIME_SECONDS: '1',
-      // timing coerente com a validação de startup: statement > 2 × lock; max((3+1)×1s, 2×1s + 2×2,5s) + backoff ≈ 7s × 1,5 < 11s
+      // timing coerente com a validação de startup: statement > 2 × lock, watchdog > statement;
+      // max((3+1)×1s, 2×1s + 3s + 2,5s) + backoff ≈ 7,53s × 1,5 ≈ 11,3s ≤ 12s
       DB_LOCK_TIMEOUT_MS: '1000',
       DB_STATEMENT_TIMEOUT_MS: '2500',
+      DB_QUERY_TIMEOUT_MS: '3000',
       UOW_MAX_ATTEMPTS: '3',
-      SQS_VISIBILITY_TIMEOUT_SECONDS: '11',
+      SQS_VISIBILITY_TIMEOUT_SECONDS: '12',
       OUTBOX_INTERVAL_MS: '100',
       OUTBOX_BATCH_SIZE: '100',
       PENDING_REFERENCE_BASE_DELAY_MS: '200',

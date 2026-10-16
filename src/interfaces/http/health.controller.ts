@@ -4,6 +4,16 @@ import type { Response } from 'express';
 import { SQS_GATEWAY, type SqsGateway } from '../../infrastructure/messaging/sqs/sqs-gateway';
 import { Public } from './auth.guard';
 
+const READY_CHECK_TIMEOUT_MS = 1_000;
+
+function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`readiness check timed out after ${ms} ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 @Public()
 @Controller('health')
 export class HealthController {
@@ -27,13 +37,12 @@ export class HealthController {
   @Get('ready')
   async ready(@Res({ passthrough: true }) res: Response) {
     const [postgres, sqs] = await Promise.all([
-      this.orm.em
-        .fork()
-        .execute('SELECT 1')
+      // Timeout curto: com o banco fora (ou o pool esgotado), readiness responde 503 em vez de travar.
+      withTimeout(this.orm.em.fork().execute('SELECT 1'), READY_CHECK_TIMEOUT_MS)
         .then(() => 'up' as const)
         .catch(() => 'down' as const),
       this.sqs
-        .ping(1_000)
+        .ping(READY_CHECK_TIMEOUT_MS)
         .then(() => 'up' as const)
         .catch(() => 'down' as const),
     ]);
