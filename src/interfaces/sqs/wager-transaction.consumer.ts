@@ -20,7 +20,21 @@ import type { Logger } from '../../infrastructure/observability/logger';
 import type { AppMetrics } from '../../infrastructure/observability/metrics';
 import { wagerMessageData, wagerMessageEnvelope } from '../contracts';
 
-export type Disposition = 'processed' | 'duplicate' | 'business_rejected' | 'retry' | 'dead_lettered' | 'released';
+export type Disposition =
+  | 'processed'
+  | 'duplicate'
+  | 'business_rejected'
+  | 'retry'
+  | 'dead_lettered'
+  | 'dead_letter_failed'
+  | 'released'
+  | 'held_behind';
+
+/**
+ * Desfechos em que a mensagem NÃO terminou (continua na fila): as seguintes do mesmo grupo não podem ser
+ * processadas antes dela, senão a ordem FIFO da wallet se inverte (BET2 aplicada antes da BET1 em retry).
+ */
+const BLOCKS_GROUP: ReadonlySet<Disposition> = new Set(['retry', 'dead_letter_failed']);
 
 export interface ConsumerOptions {
   consumerName: string;
@@ -61,10 +75,16 @@ const SAFE_ID = /^[A-Za-z0-9._:-]{1,128}$/;
  *  - transitório → devolve à fila com backoff (ChangeMessageVisibility) até maxAttempts;
  *  - esgotado/inesperado → FAILED (transação separada) → DLQ; inválido/conflito → DLQ.
  * Concorrência: sequencial DENTRO de um MessageGroupId (= walletId, preserva a ordem FIFO
- * por wallet) e paralelo ENTRE grupos.
+ * por wallet) e paralelo ENTRE grupos. Se uma mensagem do grupo não termina (retry), as seguintes do mesmo
+ * lote NÃO são processadas: voltam à fila com visibilidade MAIOR que o atraso do retry, para que a que falhou
+ * seja entregue antes delas. No SQS FIFO o grupo já fica bloqueado enquanto a mensagem em retry está em voo; o
+ * LocalStack não bloqueia (verificado), e o atraso maior cobre esse caso numa janela de retry. A ordem do broker
+ * é otimização (enunciado §8): quem garante as invariantes é o banco.
  */
 export class WagerTransactionConsumer {
   private stopping = false;
+  /** Atraso (s) do retry agendado para a mensagem: as seguintes do grupo voltam depois dela. */
+  private readonly retryDelaySeconds = new WeakMap<ReceivedMessage, number>();
   private loop: Promise<void> | undefined;
   private readonly retryBackoff: ExponentialBackoff;
 
@@ -136,12 +156,23 @@ export class WagerTransactionConsumer {
     const results = await Promise.all(
       [...groups.values()].map(async (group) => {
         const out: Disposition[] = [];
+        let blocker: { id: string; holdSeconds: number } | undefined;
         for (const message of group) {
           if (this.stopping) {
             out.push(await this.release(message));
             continue;
           }
-          out.push(await this.handle(message));
+          if (blocker) {
+            out.push(await this.holdBehind(message, blocker));
+            continue;
+          }
+          const disposition = await this.handle(message);
+          out.push(disposition);
+          if (BLOCKS_GROUP.has(disposition)) {
+            // Em retry: volta depois de `delay`; DLQ que falhou: volta quando a visibilidade expirar.
+            const delay = this.retryDelaySeconds.get(message) ?? this.options.visibilityTimeoutSeconds;
+            blocker = { id: message.sqsMessageId, holdSeconds: delay + 1 };
+          }
         }
         return out;
       }),
@@ -234,6 +265,7 @@ export class WagerTransactionConsumer {
     if (message.receiveCount < this.options.maxAttempts) {
       const delaySeconds = Math.ceil(this.retryBackoff.delayMs(message.receiveCount) / 1000);
       await this.gateway.changeVisibility(message, delaySeconds).catch(() => undefined);
+      this.retryDelaySeconds.set(message, delaySeconds);
       this.metrics.sqsRetries.inc();
       this.metrics.sqsMessages.inc({ outcome: 'retry' });
       log.warn({ msg: transient ? 'transient failure; will retry' : 'unexpected failure; will retry', delaySeconds, err: error });
@@ -288,17 +320,36 @@ export class WagerTransactionConsumer {
       this.logger.warn({ msg: 'message moved to DLQ', sqsMessageId: message.sqsMessageId, reason });
     } catch (error) {
       // SQS indisponível: a mensagem volta após o visibility timeout e o redrive é a rede de segurança.
+      // Ela não terminou, então bloqueia as seguintes do grupo (BLOCKS_GROUP).
       this.logger.error({ msg: 'failed to move message to DLQ', sqsMessageId: message.sqsMessageId, reason, err: error });
+      return 'dead_letter_failed';
     }
     return 'dead_lettered';
   }
 
-  /** Shutdown: mensagem recebida que não começou volta para a fila na hora (outra réplica a pega). */
+  /**
+   * Devolve à fila na hora uma mensagem recebida que não começou: no shutdown (outra réplica a pega) ou porque uma
+   * anterior do mesmo grupo não terminou (ordem FIFO; ela volta atrás da que está em retry).
+   */
   private async release(message: ReceivedMessage): Promise<Disposition> {
     await this.gateway.changeVisibility(message, 0).catch(() => undefined);
     this.metrics.sqsMessages.inc({ outcome: 'released' });
     this.logger.info({ msg: 'message released on shutdown', sqsMessageId: message.sqsMessageId, groupId: message.groupId });
     return 'released';
+  }
+
+  /** Uma anterior do mesmo grupo não terminou: esta volta à fila DEPOIS dela, sem ser processada. */
+  private async holdBehind(message: ReceivedMessage, blocker: { id: string; holdSeconds: number }): Promise<Disposition> {
+    await this.gateway.changeVisibility(message, blocker.holdSeconds).catch(() => undefined);
+    this.metrics.sqsMessages.inc({ outcome: 'held_behind' });
+    this.logger.info({
+      msg: 'message held behind an earlier message of its group that did not complete',
+      sqsMessageId: message.sqsMessageId,
+      groupId: message.groupId,
+      blockedBy: blocker.id,
+      holdSeconds: blocker.holdSeconds,
+    });
+    return 'held_behind';
   }
 
   /** Envelope tolerante; `data` estrito. */

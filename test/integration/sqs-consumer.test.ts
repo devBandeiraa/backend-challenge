@@ -509,3 +509,44 @@ describe('teto do heartbeat (maxProcessingMs)', () => {
     expect(await countRows(app.orm, `wallet_ledger_entries l JOIN wager_transactions t ON t.id = l.transaction_id WHERE t.idempotency_key = ?`, [cmd.idempotencyKey])).toBe(1);
   }, 45_000);
 });
+
+describe('ordem FIFO do grupo', () => {
+  test('mensagem em retry segura as seguintes do MESMO grupo: BET1 (90) é aplicada antes da BET2 (20)', async () => {
+    const w = await wallet('100.00');
+    const bet1 = wagerCommand(w, { money: { amount: '90.00', currency: 'BRL' } });
+    const bet2 = wagerCommand(w, { money: { amount: '20.00', currency: 'BRL' } });
+
+    // outra transação segura a wallet: a BET1 estoura o lock_timeout (200 ms, 1 tentativa) e vai para retry
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    let locked!: () => void;
+    const isLocked = new Promise<void>((r) => (locked = r));
+    const holder = app.orm.em.fork().transactional(async (em) => {
+      await em.execute(`SELECT id FROM wallets WHERE id = ? FOR NO KEY UPDATE`, [w.id]);
+      locked();
+      await released;
+    });
+    await isLocked;
+
+    // as duas no MESMO grupo, enviadas antes de o consumer começar: chegam no mesmo lote do ReceiveMessage
+    await send(wagerMessage(messageData(bet1)).body, w.id);
+    await send(wagerMessage(messageData(bet2)).body, w.id);
+    const retriesBefore = (await app.metrics.sqsRetries.get()).values[0]?.value ?? 0;
+    const c = consumer();
+    c.start();
+    // solta o lock no instante em que a BET1 entra em retry: é a janela em que a BET2 passava na frente
+    await waitFor(async () => ((await app.metrics.sqsRetries.get()).values[0]?.value ?? 0) > retriesBefore || undefined, 15_000, 5);
+    release();
+    await holder;
+
+    await waitFor(async () => {
+      const [a, b] = [await statusOf(bet1.idempotencyKey), await statusOf(bet2.idempotencyKey)];
+      return (a && b && a.status !== 'PENDING' && b.status !== 'PENDING') || undefined;
+    }, 20_000);
+    expect(await statusOf(bet1.idempotencyKey)).toEqual({ status: 'PROCESSED', failure_code: null });
+    expect(await statusOf(bet2.idempotencyKey)).toEqual({ status: 'REJECTED', failure_code: 'INSUFFICIENT_FUNDS' });
+    expect(await walletBalance(app.orm, w.id)).toBe('10.00');
+    const heldBehind = (await app.metrics.sqsMessages.get()).values.find((v) => v.labels.outcome === 'held_behind')?.value ?? 0;
+    expect(heldBehind).toBeGreaterThanOrEqual(1); // a BET2 foi devolvida atrás da BET1, não processada fora de ordem
+  }, 60_000);
+});

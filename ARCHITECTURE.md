@@ -512,8 +512,24 @@ com a mesma key; cada BET PROCESSED debitou uma vez e a invariante bate.
   - `data` é zod `strict`, com `idempotencyKey`.
 - **Ack só depois do commit.** Um crash entre o commit e o ack causa redelivery, que a inbox reconhece:
   nenhum efeito novo. Provado com processo real morto com `exit 137` no hook pós-commit.
-- **Ordem:** sequencial **dentro** de um `MessageGroupId` (walletId), paralela entre grupos. Uma mensagem
-  em retry segura a fila daquela wallet, que é o comportamento FIFO.
+- **Ordem por wallet: best-effort; o banco é a autoridade** (enunciado §8: "recursos de ordenação e deduplicação do
+  broker são otimização, não a garantia final").
+  - Dentro de um lote do `ReceiveMessage`, as mensagens do mesmo `MessageGroupId` (walletId) são processadas **em
+    sequência**; grupos diferentes, em paralelo.
+  - **Se uma mensagem do grupo não termina** (retry, ou DLQ que falhou), as seguintes do mesmo grupo **não são
+    processadas**: voltam à fila com visibilidade maior que o atraso do retry (`held_behind`), para que a que falhou
+    seja entregue antes delas. Na v1.0.0 o consumer seguia processando o grupo: com a BET1 (90,00) em retry, a BET2
+    (20,00) era aplicada antes e a BET1 terminava `INSUFFICIENT_FUNDS` (reauditoria, M1).
+  - **Por que best-effort:** no SQS FIFO, o grupo fica bloqueado enquanto uma mensagem dele está em voo, e isso preserva
+    a ordem entre entregas. O LocalStack 4.14 **não** bloqueia: depois de m1 ir para retry (visibilidade 3 s) e m2 voltar
+    com visibilidade 0, o `ReceiveMessage` seguinte devolve m2 com m1 ainda em voo (verificado). O atraso maior cobre
+    esse caso numa janela de retry, não em retries sucessivos da mesma mensagem, nem entre réplicas que recebem lotes
+    diferentes. Garantir ordem estrita exigiria número de sequência por wallet no banco, fora do escopo.
+  - **O que não depende da ordem:** nenhuma invariante. Saldo, unicidade, reversão única e referência fora de ordem são
+    decididos no banco, sob o lock da wallet (§5); a ordem só muda **qual** de duas apostas concorrentes vence quando o
+    saldo não cobre as duas, como já acontece com duas requisições HTTP simultâneas.
+  - **Prova:** "ordem FIFO do grupo" em [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts): BET1 em retry por
+    lock, o lock é solto no instante do retry; BET1 PROCESSED, BET2 REJECTED, saldo 10,00. Sem o bloqueio, o teste falha.
 
 | Erro | Ação | FAILED? |
 |---|---|---|
@@ -738,7 +754,7 @@ No compose também: `init: true` (tini como PID 1, porque o Nest re-emite o sina
 | `wagering_outbox_lag_seconds`, `..._pending_messages`, `..._published_total`, `..._publish_failures_total` | outbox |
 | `wagering_pending_reference_resolutions_total{result}` | tentativas do worker |
 | `wagering_reconciliation_mismatches_total` | divergências encontradas |
-| `wagering_processing_duration_seconds{source,outcome}` | latência (histograma) de **todo** desfecho: status do resultado ou categoria do erro no HTTP (`validation`, `conflict`, `business`, `transient`, `internal`); disposição da mensagem no SQS (`processed`, `duplicate`, `retry`, `dead_lettered`...) |
+| `wagering_processing_duration_seconds{source,outcome}` | latência (histograma) de **todo** desfecho: status do resultado ou categoria do erro no HTTP (`validation`, `conflict`, `business`, `transient`, `internal`); disposição da mensagem no SQS (`processed`, `duplicate`, `retry`, `dead_lettered`, `dead_letter_failed`, `released`, `held_behind`...) |
 
 - **Health:**
   - `/health/live` só verifica o processo; nunca consulta dependências, senão uma queda do banco
