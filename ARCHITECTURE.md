@@ -880,6 +880,33 @@ Trocar o guard por essa implementação não altera controllers nem use cases.
 **Contagem atual:** `bun run test` = **368 testes** em 28 arquivos; `bun run test:multi` = **8 testes** (o 8º é a queda do
 Postgres, §5.4).
 
+**Validação a partir de clone limpo da v1.0.1 (16/10/2026, depois das correções da reauditoria).** `git clone` do branch
+num diretório novo e um projeto Compose isolado, com volume, banco, papéis, filas e imagens criados do zero, seguindo só
+o README:
+
+| Passo | Resultado |
+|---|---|
+| `bun install --frozen-lockfile` | 179 pacotes, lockfile respeitado |
+| `bun run infra:up` | 9 migrations; `wagering_app` e `wagering_app_rw` sem superuser; filas criadas |
+| `bun run typecheck` | sem erros |
+| `bun run test` | **368 pass, 0 fail** |
+| `bun run test:multi` | **8 pass, 0 fail**; queda do Postgres: 3 réplicas ready 0,9 s depois de ele ficar healthy, só 503 durante a queda; SIGTERM: 30 mensagens em 426 ms |
+| `bun run test:load` (30 s, 50 clientes) | 200,1 req/s, p50 132 ms, p99 1,95 s, 0 erros 5xx ou de rede; 0 divergências, 0 lançamentos duplicados, 0 saldos negativos em 201 wallets |
+
+A 1ª tentativa dessa validação acusou 1 falha (367/1): o teste novo de erro de conexão no consumer lia a métrica no
+instante em que a linha ficava PROCESSED, mas o consumer registra o desfecho depois do commit e do ack. O teste passou a
+esperar a métrica e a validação foi refeita do zero.
+
+`bun run test:multi` 5 vezes seguidas (16/10/2026, v1.0.1):
+
+| Execução | resultado | `bun test` | queda do Postgres: ready em | SIGTERM: 30 mensagens em |
+|---|---|---|---|---|
+| 1 | 8 pass | 72,5 s | 1.080 ms | 370 ms |
+| 2 | 8 pass | 87,0 s | 1.024 ms | 386 ms |
+| 3 | 8 pass | 70,2 s | 1.094 ms | 320 ms |
+| 4 | 8 pass | 70,8 s | 983 ms | 441 ms |
+| 5 | 8 pass | 71,1 s | 1.146 ms | 378 ms |
+
 **Validação a partir de clone limpo da v1.0.0 (15/10/2026, após as correções da 1ª auditoria; histórico).** As contagens
 abaixo são as daquele dia; a própria tag v1.0.0 já tinha 331 e 7 testes, porque testes foram acrescentados depois da
 validação e a tabela não foi atualizada (apontado na reauditoria). `git clone` num diretório
