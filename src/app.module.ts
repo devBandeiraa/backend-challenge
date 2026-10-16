@@ -17,6 +17,7 @@ import { createLogger, type Logger, PinoNestLogger } from './infrastructure/obse
 import { AppMetrics, METRICS } from './infrastructure/observability/metrics';
 import { buildOrmConfig } from './infrastructure/persistence/mikro-orm.config';
 import { MikroOrmUnitOfWork } from './infrastructure/persistence/mikro-orm-unit-of-work';
+import { isTransientDbError } from './infrastructure/persistence/pg-errors';
 import { SystemClock, UuidV7Generator } from './infrastructure/system';
 import { BackgroundProcesses } from './infrastructure/workers/background-processes';
 import { OutboxPublisher } from './infrastructure/workers/outbox-publisher';
@@ -53,7 +54,7 @@ const useCases = [
   {
     provide: ResolvePendingReferencesUseCase,
     useFactory: (uow: UnitOfWork, clock: Clock, ids: IdGenerator, policy: PendingReferencePolicy) =>
-      new ResolvePendingReferencesUseCase(uow, clock, ids, policy),
+      new ResolvePendingReferencesUseCase(uow, clock, ids, policy, isTransientDbError),
     inject: [UNIT_OF_WORK, CLOCK, ID_GENERATOR, PENDING_POLICY],
   },
   { provide: WalletQueries, useFactory: (uow: UnitOfWork) => new WalletQueries(uow), inject: [UNIT_OF_WORK] },

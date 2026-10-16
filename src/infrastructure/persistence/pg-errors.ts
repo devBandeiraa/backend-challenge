@@ -50,22 +50,56 @@ export function constraintOf(error: unknown): string | undefined {
   return typeof c === 'string' ? c : undefined;
 }
 
-export function classifyPgError(error: unknown): PgErrorKind {
-  const state = sqlStateOf(error);
-  if (state && RETRYABLE_SQLSTATES.has(state)) return 'retryable';
-  if (state === '23505' && RETRYABLE_UNIQUE_CONSTRAINTS.has(constraintOf(error) ?? '')) return 'retryable';
-  if (state && (UNAVAILABLE_SQLSTATES.has(state) || UNAVAILABLE_SQLSTATE_PREFIXES.some((p) => state.startsWith(p)))) {
-    return 'unavailable';
+/**
+ * Erro de conexão SEM SQLSTATE (o servidor sumiu, o socket caiu, o pool não deu vaga): o \`pg\` só manda SQLSTATE
+ * em erros do servidor, então um erro do driver sem código é, por construção, de conexão. As mensagens cobrem os
+ * casos em que o erro nem passa pelo driver do MikroORM (pg-pool, watchdog de query).
+ */
+const CONNECTION_ERROR_MESSAGE =
+  /not queryable|Connection terminated|Connection ended|timeout exceeded when trying to connect|Query read timeout|without a response: connection destroyed|terminating connection|server closed the connection|socket hang up|read ECONNRESET|connect ECONNREFUSED|Client was closed/i;
+
+/** Erros do driver/ORM (o erro e as causas encadeadas). */
+const DRIVER_ERROR_NAMES = new Set(['DriverException', 'ConnectionException', 'DatabaseError']);
+
+function chainOf(error: unknown): PgLikeError[] {
+  const out: PgLikeError[] = [];
+  let current: unknown = error;
+  for (let depth = 0; current && typeof current === 'object' && depth < 5; depth++) {
+    out.push(current as PgLikeError);
+    const next = (current as { cause?: unknown; previous?: unknown }).cause ?? (current as { previous?: unknown }).previous;
+    if (next === current) break;
+    current = next;
   }
-  if (state && UNAVAILABLE_NODE_CODES.has(state)) return 'unavailable';
-  const name = (error as PgLikeError | null)?.name;
-  if (name === 'ConnectionException') return 'unavailable';
-  const message = (error as PgLikeError | null)?.message;
-  // pg-pool não tem código para timeout de aquisição de conexão.
-  if (typeof message === 'string' && /timeout exceeded when trying to connect|Connection terminated/i.test(message)) {
-    return 'unavailable';
+  return out;
+}
+
+export function classifyPgError(error: unknown): PgErrorKind {
+  const chain = chainOf(error);
+  for (const e of chain) {
+    const state = sqlStateOf(e);
+    if (state && RETRYABLE_SQLSTATES.has(state)) return 'retryable';
+    if (state === '23505' && RETRYABLE_UNIQUE_CONSTRAINTS.has(constraintOf(e) ?? '')) return 'retryable';
+    if (state && (UNAVAILABLE_SQLSTATES.has(state) || UNAVAILABLE_SQLSTATE_PREFIXES.some((p) => state.startsWith(p)))) {
+      return 'unavailable';
+    }
+    if (state && UNAVAILABLE_NODE_CODES.has(state)) return 'unavailable';
+    // Qualquer outro SQLSTATE é erro do servidor com significado próprio (integridade, sintaxe...): não é conexão.
+    if (state && /^[0-9A-Z]{5}$/.test(state)) return 'other';
+  }
+  for (const e of chain) {
+    const name = typeof e.name === 'string' ? e.name : '';
+    const message = typeof e.message === 'string' ? e.message : '';
+    if (name === 'ConnectionException') return 'unavailable';
+    if (CONNECTION_ERROR_MESSAGE.test(message)) return 'unavailable';
+    // Erro do driver sem SQLSTATE: falha de transporte (o servidor não chegou a responder com um erro).
+    if (DRIVER_ERROR_NAMES.has(name) && sqlStateOf(e) === undefined) return 'unavailable';
   }
   return 'other';
+}
+
+/** Falha de infraestrutura transitória (conexão, disponibilidade ou concorrência), nunca motivo para FAILED. */
+export function isTransientDbError(error: unknown): boolean {
+  return classifyPgError(error) !== 'other';
 }
 
 export function isUniqueViolation(error: unknown, constraint: string): boolean {

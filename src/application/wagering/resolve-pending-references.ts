@@ -20,6 +20,9 @@ export interface ResolveResult {
  * Falhas: transitória → a linha continua pendente (rollback) e volta no próximo ciclo.
  * Não transitória (bug, dado inesperado) → FAILED/PROCESSING_FAILED numa transação separada,
  * para uma linha "venenosa" não ser reivindicada em loop para sempre.
+ * Erro de conexão/disponibilidade NUNCA vira FAILED: além de a unit of work já o converter em
+ * TransientInfrastructureError, `isTransient` (classificação da infraestrutura) é conferido de novo aqui,
+ * porque marcar FAILED por um soluço do banco tornaria terminal uma transação legítima.
  */
 export class ResolvePendingReferencesUseCase {
   private readonly settler: TransactionSettler;
@@ -29,6 +32,7 @@ export class ResolvePendingReferencesUseCase {
     private readonly clock: Clock,
     ids: IdGenerator,
     policy: PendingReferencePolicy = DEFAULT_PENDING_REFERENCE_POLICY,
+    private readonly isTransient: (error: unknown) => boolean = () => false,
   ) {
     this.settler = new TransactionSettler(clock, ids, policy);
   }
@@ -50,7 +54,11 @@ export class ResolvePendingReferencesUseCase {
           return { transactionId: tx.id, status: tx.status };
         });
       } catch (error) {
-        const permanent = claimedId !== undefined && !(error instanceof TransientInfrastructureError) && !(error instanceof ApplicationError);
+        const permanent =
+          claimedId !== undefined &&
+          !(error instanceof TransientInfrastructureError) &&
+          !(error instanceof ApplicationError) &&
+          !this.isTransient(error);
         if (!permanent) throw error;
         result = { transactionId: claimedId!, status: await this.markFailed(claimedId!) };
       }

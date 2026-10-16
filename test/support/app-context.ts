@@ -9,6 +9,7 @@ import { OpenWalletUseCase } from '../../src/application/wallets/open-wallet';
 import { ExponentialBackoff } from '../../src/domain/messaging/backoff-policy';
 import { AppMetrics } from '../../src/infrastructure/observability/metrics';
 import { MikroOrmUnitOfWork, type UnitOfWorkOptions } from '../../src/infrastructure/persistence/mikro-orm-unit-of-work';
+import { isTransientDbError } from '../../src/infrastructure/persistence/pg-errors';
 import { SystemClock, UuidV7Generator } from '../../src/infrastructure/system';
 import { createTestOrm } from './db';
 
@@ -47,7 +48,7 @@ export async function createAppContext(options: AppContextOptions | number = {})
     metrics,
     openWallet: new OpenWalletUseCase(uow, clock, ids),
     processTransaction: new ProcessWagerTransactionUseCase(uow, clock, ids, pending),
-    resolvePending: new ResolvePendingReferencesUseCase(uow, clock, ids, pending),
+    resolvePending: new ResolvePendingReferencesUseCase(uow, clock, ids, pending, isTransientDbError),
     close: () => orm.close(true),
   };
 }

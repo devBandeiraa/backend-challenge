@@ -2,6 +2,7 @@ import 'reflect-metadata';
 import type { INestApplication } from '@nestjs/common';
 import { Test } from '@nestjs/testing';
 import { AppModule, configureHttp, LOGGER } from '../../src/app.module';
+import { UNIT_OF_WORK, type UnitOfWork } from '../../src/application/ports';
 import { createLogger } from '../../src/infrastructure/observability/logger';
 import { ensureMigrated } from './db';
 
@@ -10,6 +11,8 @@ export interface StartOptions {
   env?: Record<string, string>;
   /** Captura as linhas JSON de log da app (para testes de observabilidade). */
   logLines?: string[];
+  /** Injeção de falha: recebe a unit of work REAL da app (a mesma instância usada pelos use cases). */
+  patchUnitOfWork?: (uow: UnitOfWork) => void;
 }
 
 /**
@@ -19,7 +22,8 @@ export interface StartOptions {
 export async function startHttpApp(
   options: StartOptions | Record<string, string> = {},
 ): Promise<{ app: INestApplication; baseUrl: string; close: () => Promise<void> }> {
-  const opts: StartOptions = 'env' in options || 'logLines' in options ? (options as StartOptions) : { env: options as Record<string, string> };
+  const opts: StartOptions =
+    'env' in options || 'logLines' in options || 'patchUnitOfWork' in options ? (options as StartOptions) : { env: options as Record<string, string> };
   await ensureMigrated();
   const overrides = { APP_ROLES: 'http', LOG_LEVEL: 'silent', ...opts.env };
   const previous = Object.fromEntries(Object.keys(overrides).map((k) => [k, process.env[k]]));
@@ -34,6 +38,7 @@ export async function startHttpApp(
       builder.overrideProvider(LOGGER).useValue(logger);
     }
     const moduleRef = await builder.compile();
+    opts.patchUnitOfWork?.(moduleRef.get<UnitOfWork>(UNIT_OF_WORK));
     app = moduleRef.createNestApplication({ logger: ['error'] });
     configureHttp(app);
     await app.listen(0);

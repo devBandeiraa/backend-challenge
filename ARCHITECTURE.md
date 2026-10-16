@@ -410,7 +410,23 @@ ainda o usar. Tabela nova numa migration futura precisa de `GRANT` explícito.
 - **`lock_timeout` por transação** (`SET LOCAL`, 5 s): sem teto, uma hot wallet empilharia conexões
   esperando indefinidamente. Com ele, a espera vira `55P03`, depois retry e, se persistir, 503:
   degradação explícita e mensurável. Prova: [transient-failures.test.ts](test/integration/transient-failures.test.ts).
-- **Classificação de erros:** por SQLSTATE e nome de constraint, nunca por mensagem ([pg-errors.ts](src/infrastructure/persistence/pg-errors.ts)).
+- **Classificação de erros** ([pg-errors.ts](src/infrastructure/persistence/pg-errors.ts)), percorrendo o erro e as causas
+  encadeadas (`cause`/`previous` do MikroORM):
+  - SQLSTATE manda: `40001`/`40P01`/`55P03` e `wt_single_reversal_uq` são **retryable**; classe `08`, `57P01`–`57P03`,
+    `53300` e `57014` são **unavailable**; qualquer outro SQLSTATE é erro do servidor com significado próprio (**other**).
+  - **Sem SQLSTATE** (o `pg` só manda SQLSTATE em erros do servidor): erro do driver (`DriverException`/`ConnectionException`)
+    ou mensagem de transporte conhecida ("not queryable", "Connection terminated", timeout de aquisição do pool, watchdog
+    de query, `ECONNREFUSED`...) é **unavailable**. Na v1.0.0, "Client has encountered a connection error and is not
+    queryable" caía em **other** e virava **HTTP 500** (reauditoria, achado M3).
+  - **unavailable** vira `TransientInfrastructureError` na unit of work: **503 + Retry-After** no HTTP, **retry** no consumer.
+  - O worker de PENDING_REFERENCE **nunca** marca FAILED por erro transitório: além da conversão da unit of work, ele
+    confere `isTransientDbError` de novo antes de gravar FAILED. Só erro de programação/dado (linha venenosa) vira FAILED.
+  - **Prova:** [connection-failures.test.ts](test/integration/connection-failures.test.ts), com a conexão REAL derrubada por
+    `pg_terminate_backend`: (a) no meio da espera do lock (57P01) e (b) **entre** duas instruções, o que produz o
+    "not queryable" sem SQLSTATE. Para HTTP (503, nunca 500; o reenvio debita uma vez), consumer (retry, sem DLQ nem
+    FAILED) e worker (a linha continua PENDING_REFERENCE e é resolvida depois). Por mutação: com o classificador antigo,
+    o HTTP responde 500 e o teste do worker falha. Matriz de classificação em
+    [pg-errors.test.ts](test/unit/infrastructure/pg-errors.test.ts).
 - **Ids:** UUIDv7 (`Bun.randomUUIDv7`): ordenáveis por tempo e sem coordenação entre instâncias.
 
 ### 5.4 Queda do Postgres: o pool se recupera sozinho
@@ -568,7 +584,8 @@ com a mesma key; cada BET PROCESSED debitou uma vez e a invariante bate.
   Fora de ordem em provedores é questão de segundos; minutos cobrem atraso de fila sem prender a
   transação indefinidamente. Ao esgotar: `REJECTED`/`REFERENCE_NOT_FOUND` + `WagerTransactionRejected`.
 - **Evento:** `WagerTransactionPendingReference` só na **entrada**; reagendamentos não repetem.
-- **Falhas:** erro transitório deixa a linha pendente para o próximo ciclo; erro não transitório a torna FAILED.
+- **Falhas:** erro transitório (conexão, disponibilidade, concorrência) deixa a linha pendente para o próximo ciclo e
+  **nunca** a torna FAILED (§5.3); só erro não transitório (bug, dado inesperado) a torna FAILED.
 
 ### 7.5 Outbox publisher
 - **Reivindicação:** `em.find(..., { lockMode: LockMode.PESSIMISTIC_PARTIAL_WRITE })`, que gera
