@@ -338,6 +338,7 @@ na seção indicada e uma prova.
 | 14 | FAILED é erro permanente de infraestrutura | gravado só pelo consumer (limite de recebimentos) e pelo worker (linha venenosa); HTTP responde 503; replay de FAILED → 422 `PROCESSING_FAILED`; sem evento | FAILED é terminal e não pode nascer de erro transitório | §7.1–7.2; [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts) |
 | 15 | — | `providerId` `internal` reservado (400 / DLQ) | namespace das transações internas (OPENING) | §8; [http-api.test.ts](test/integration/http-api.test.ts) |
 | 16 | Destino dos eventos não definido | `wager-events.fifo`, grupo = aggregateId, dedup = eventId | ordem por agregado e dedup no broker | decisão F |
+| 17 | UUIDs (playerId, walletId, parâmetros de rota) | normalizados para **minúsculas** na entrada (HTTP e fila), antes do payloadHash e da política | o RFC 9562 trata hex como case-insensitive; sem isso, a mesma BET em maiúsculas era rejeitada com `PLAYER_MISMATCH` (reauditoria, M2) | §8; [http-api.test.ts](test/integration/http-api.test.ts), [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts) |
 
 ---
 
@@ -673,6 +674,10 @@ No compose também: `init: true` (tini como PID 1, porque o Nest re-emite o sina
 - **`providerId` reservado:** `internal` (sem diferenciar maiúsculas) é o namespace das transações criadas pelo próprio
   serviço (OPENING) e é recusado com 400 no HTTP e com DLQ (`invalid_data`) na fila, antes de qualquer acesso ao banco;
   o domínio (`WagerTransaction.create`) recusa também.
+- **UUIDs normalizados para minúsculas** na entrada (`uuidSchema` em [contracts.ts](src/interfaces/contracts.ts), HTTP e fila):
+  o Postgres devolve o tipo `uuid` em minúsculas, e a política compara o comando com o que leu do banco. Na v1.0.0,
+  a mesma BET com o UUID em maiúsculas virava `PLAYER_MISMATCH` terminal, e reenviá-la em outra caixa gerava outro
+  payloadHash (409). Agora a grafia não muda nem o resultado nem o hash.
 - **zod `strict`:** campo desconhecido gera 400. Num WIN, um typo em `referenceExternalTransactionId`
   seria descartado em silêncio. O conteúdo do dinheiro é validado só pelo `Money` (fonte única).
 - **Cursor do ledger:** `base64url({ w: walletId, v: wallet_version })`, em ordem decrescente.

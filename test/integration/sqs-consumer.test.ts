@@ -98,6 +98,16 @@ describe('processamento', () => {
     await waitFor(async () => (await statusOf(cmd.idempotencyKey))?.status === 'PROCESSED');
   });
 
+  test('UUID em maiúsculas na fila é normalizado: a BET é processada', async () => {
+    const w = await wallet('100.00');
+    const cmd = wagerCommand({ id: w.id.toUpperCase(), playerId: w.playerId.toUpperCase() });
+    const c = consumer();
+    await send(wagerMessage(messageData(cmd)).body, w.id);
+    c.start();
+    await waitFor(async () => (await statusOf(cmd.idempotencyKey))?.status === 'PROCESSED' || undefined, 15_000);
+    expect(await walletBalance(app.orm, w.id)).toBe('90.00');
+  });
+
   test('redelivery da MESMA mensagem (mesmo messageId): inbox detecta, nenhum efeito novo', async () => {
     const w = await wallet('100.00');
     const cmd = wagerCommand(w, { money: { amount: '10.00', currency: 'BRL' } });

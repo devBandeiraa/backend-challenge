@@ -9,6 +9,14 @@ import { SUBMITTABLE_KINDS } from '../domain/wagering/wager-transaction-kind';
 // seria descartado em silêncio; em API financeira, rejeitar é mais seguro que ignorar.
 
 export const text = (max: number) => z.string().min(1).max(max);
+/**
+ * UUID normalizado para minúsculas na ENTRADA (HTTP e fila). O RFC 9562 trata os dígitos hex como
+ * case-insensitive e o Postgres guarda o tipo uuid normalizado; sem isto, a política comparava a grafia crua
+ * do comando com a lida do banco e rejeitava uma BET legítima com PLAYER_MISMATCH/REFERENCE_MISMATCH, e a
+ * mesma operação reenviada em outra caixa virava outro payloadHash (409).
+ */
+export const uuidSchema = () => z.uuid().transform((value) => value.toLowerCase());
+
 export const moneySchema = z.object({ amount: z.string(), currency: z.string() }).strict();
 
 /** "internal" é o namespace das transações criadas pelo próprio serviço (OPENING): nenhum provedor o usa. */
@@ -19,8 +27,8 @@ export const providerIdSchema = text(64).refine((v) => v.toLowerCase() !== INTER
 const wagerFields = {
   providerId: providerIdSchema,
   externalTransactionId: text(128),
-  playerId: z.uuid(),
-  walletId: z.uuid(),
+  playerId: uuidSchema(),
+  walletId: uuidSchema(),
   roundId: text(128),
   gameId: text(128),
   kind: z.enum(SUBMITTABLE_KINDS.map(String) as ['BET', 'WIN', 'LOSS', 'REFUND', 'ROLLBACK']),

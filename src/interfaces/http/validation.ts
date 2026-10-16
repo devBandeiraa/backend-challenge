@@ -1,19 +1,19 @@
 import { z } from 'zod';
 import { ValidationError } from '../../application/errors';
-import { idempotencyKeySchema, moneySchema, submitTransactionBody, text } from '../contracts';
+import { idempotencyKeySchema, moneySchema, submitTransactionBody, text, uuidSchema } from '../contracts';
 
 export { submitTransactionBody, text };
 
 export const openWalletBody = z
   .object({
-    playerId: z.uuid(),
+    playerId: uuidSchema(),
     initialBalance: moneySchema,
   })
   .strict();
 
 export const idempotencyKeyHeader = idempotencyKeySchema;
 
-export const uuidParam = z.uuid();
+export const uuidParam = uuidSchema();
 
 export const ledgerQuery = z
   .object({

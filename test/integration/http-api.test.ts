@@ -215,6 +215,48 @@ describe('POST /wagering/transactions', () => {
   });
 });
 
+describe('UUID em maiúsculas (RFC 9562: hex é case-insensitive)', () => {
+  test('a mesma BET com playerId/walletId em maiúsculas é processada; reenviada em minúsculas é replay', async () => {
+    const w = await createWallet('100.00');
+    const upper = txBody({ id: w.id.toUpperCase(), playerId: w.playerId.toUpperCase() }, { money: { amount: '10.00', currency: 'BRL' } });
+    const key = `${upper.providerId}:${upper.externalTransactionId}`;
+    const first = await submit(upper, key);
+    expect(first.status).toBe(200);
+    expect(first.body).toMatchObject({ status: 'PROCESSED', balance: { amount: '90.00' }, idempotentReplay: false });
+    // mesma operação, outra grafia: mesmo payloadHash, replay (não 409)
+    const lower = await submit({ ...upper, playerId: w.playerId, walletId: w.id }, key);
+    expect(lower.status).toBe(200);
+    expect(lower.body).toMatchObject({ transactionId: first.body.transactionId, idempotentReplay: true });
+    const persisted = await call('GET', `/wagering/transactions/${first.body.transactionId.toUpperCase()}`);
+    expect(persisted.body).toMatchObject({ walletId: w.id, playerId: w.playerId, status: 'PROCESSED' });
+  });
+
+  test('REFUND com walletId em maiúsculas referenciando uma BET enviada em minúsculas: mesmo contexto, PROCESSED', async () => {
+    const w = await createWallet('100.00');
+    const bet = txBody(w, { money: { amount: '5.00', currency: 'BRL' } });
+    expect((await submit(bet)).status).toBe(200);
+    const refund = txBody({ id: w.id.toUpperCase(), playerId: w.playerId.toUpperCase() }, {
+      kind: 'REFUND',
+      money: { amount: '5.00', currency: 'BRL' },
+      referenceExternalTransactionId: bet.externalTransactionId,
+    });
+    const res = await submit(refund);
+    expect(res.status).toBe(200);
+    expect(res.body).toMatchObject({ status: 'PROCESSED', balance: { amount: '100.00' } });
+  });
+
+  test('POST /wallets e GET /wallets/:id aceitam UUID em maiúsculas', async () => {
+    const playerId = crypto.randomUUID();
+    const created = await call('POST', '/wallets', { body: { playerId: playerId.toUpperCase(), initialBalance: { amount: '1.00', currency: 'BRL' } } });
+    expect(created.status).toBe(201);
+    expect(created.body.playerId).toBe(playerId);
+    touch(created.body.id);
+    // a unicidade (player, moeda) não depende da grafia
+    expect((await call('POST', '/wallets', { body: { playerId, initialBalance: { amount: '1.00', currency: 'BRL' } } })).status).toBe(409);
+    expect((await call('GET', `/wallets/${created.body.id.toUpperCase()}`)).body).toMatchObject({ id: created.body.id, playerId });
+  });
+});
+
 describe('consultas', () => {
   test('GET /wallets/:id, 404 e 400', async () => {
     const w = await createWallet('50.00');
