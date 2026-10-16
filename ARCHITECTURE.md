@@ -125,7 +125,7 @@ Todos os testes usam **Postgres e LocalStack reais**. "e2e" = `bun run test:mult
 | Log de erro dos workers sem inundar durante indisponibilidade (12) | backoff no [polling-worker.ts](src/infrastructure/workers/polling-worker.ts) | [polling-worker.test.ts](test/unit/infrastructure/polling-worker.test.ts) |
 | Métricas mínimas; latência em todos os desfechos; duplicata contada uma vez (12) | [metrics.ts](src/infrastructure/observability/metrics.ts) | [observability.test.ts](test/integration/observability.test.ts) ("latência medida em TODOS os desfechos"), [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts) (redelivery = 1 duplicata), [transient-failures.test.ts](test/integration/transient-failures.test.ts) |
 | Concorrência 1–8 (13) | — | 1: [same-operation](test/concurrency/same-operation.test.ts) · 2: [hot-wallet](test/concurrency/hot-wallet.test.ts) · 3: [distinct-wallets](test/concurrency/distinct-wallets.test.ts) · 4: e2e · 5: [crash-after-commit](test/concurrency/crash-after-commit.test.ts) · 6: [outbox-publisher](test/integration/outbox-publisher.test.ts) · 7: [pending-reference-worker](test/integration/pending-reference-worker.test.ts) · 8: [restart-consistency](test/recovery/restart-consistency.test.ts) |
-| Invariante final `balance == ledger` em todos | `assertLedgerInvariant()` em `afterEach` | [invariants.ts](test/support/invariants.ts): wallets tocadas pelo teste corrente (integração, observabilidade, recuperação, e2e); nos testes de SQL puro, toda wallet criada/alterada desde o início do teste; nos de concorrência, ao fim de cada teste. Exceção deliberada: as wallets corrompidas de propósito na reconciliação |
+| Invariante final `balance == ledger` em todos | `assertLedgerInvariant()` em `afterEach` em **todas** as suítes com banco | [invariants.ts](test/support/invariants.ts): wallets registradas pelo teste corrente (`touch`: integração, concorrência, recuperação, observabilidade, e2e); nos testes de SQL puro e de privilégios, toda wallet criada/alterada desde o início do teste. Exceção deliberada: as wallets corrompidas de propósito na reconciliação |
 | Teste de carga (diferencial) | `bun run test:load` | [load-test-report.md](docs/load-test-report.md), [load-test-analysis.md](docs/load-test-analysis.md) |
 
 ---
@@ -623,10 +623,15 @@ com a mesma key; cada BET PROCESSED debitou uma vez e a invariante bate.
   - **Fora da conta:** a espera por uma vaga no pool da própria réplica (até `DB_CONNECT_TIMEOUT_MS` por tentativa,
     só quando a réplica está saturada) e a soma das esperas do lock isento da wallet. As duas são limitadas pelo teto
     do heartbeat abaixo; uma entrega que passe dele volta à fila e é deduplicada pela inbox.
-  - **Teto do heartbeat:** o heartbeat renova a visibilidade só até 1,5 × pior caso (cerca de 75 s). Depois disso a
-    mensagem volta à fila em vez de segurar o grupo FIFO da wallet para sempre; a nova entrega é deduplicada pela
-    inbox. Prova: "teto do heartbeat" em [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts) e
-    "statement_timeout" em [transient-failures.test.ts](test/integration/transient-failures.test.ts).
+  - **Teto do heartbeat:** uma mensagem presa volta à fila **no máximo em max(visibility, 1,5 × pior caso)** depois do
+    início do processamento: com os defaults, max(90 s, 79,7 s) = **90 s**. O heartbeat calcula esse prazo absoluto no
+    início e cada renovação pede só o que falta até ele. A nova entrega é deduplicada pela inbox.
+    - **Correção (reauditoria):** a v1.0.0 renovava o visibility inteiro a cada 1/3 dele, `ceil(teto/intervalo)` vezes. A
+      última renovação, em t = 90 s, empurrava a volta para **~180 s**, e não os "cerca de 75 s" que este documento dizia.
+    - **Prova:** "teto do heartbeat: prazo absoluto" em [sqs-consumer.test.ts](test/integration/sqs-consumer.test.ts)
+      (visibility 2 s, teto 5 s: a mensagem reaparece entre 3,5 s e 6,2 s; com o heartbeat antigo, 7,6 s), "teto do
+      heartbeat" (outro consumer recebe e a inbox evita o 2º efeito) e "statement_timeout" em
+      [transient-failures.test.ts](test/integration/transient-failures.test.ts).
 - **Provisionamento convergente:** `CreateQueue` só com os atributos imutáveis da FIFO, depois
   `SetQueueAttributes` com visibilidade e redrive. Mudar a configuração ajusta filas já existentes.
 
@@ -688,7 +693,7 @@ No compose também: `init: true` (tini como PID 1, porque o Nest re-emite o sina
   **dentro da rede do compose**, por outra réplica ([in-network-sender.ts](test/e2e/in-network-sender.ts) via `docker exec`):
   numa execução da reauditoria, o proxy de portas do Docker Desktop segurou um `SendMessage` do host por 30 s e o teste
   mediu o ambiente, não a aplicação. `bun run test:multi`
-  5 vezes seguidas (15/10/2026), todas com 7 pass:
+  5 vezes seguidas (15/10/2026, v1.0.0, quando o e2e tinha 7 testes), todas com 7 pass:
 
   | Execução | `bun test` | total (com build e subida) | 30 mensagens processadas em | devolvidas pela vítima |
   |---|---|---|---|---|
@@ -719,6 +724,7 @@ No compose também: `init: true` (tini como PID 1, porque o Nest re-emite o sina
 | 409 | `IDEMPOTENCY_KEY_PAYLOAD_MISMATCH`, `EXTERNAL_TRANSACTION_ID_CONFLICT`, `WALLET_ALREADY_EXISTS` | não reenviar igual |
 | 422 | REJECTED/FAILED com `failureCode` (mesmo corpo no replay) | ver taxonomia |
 | 503 | falha transitória (`Retry-After`) | reenviar com a **mesma** key |
+| 502 / 504 | **do nginx, não da app**: a réplica caiu no meio da requisição (502) ou não respondeu em 60 s (504, `proxy_read_timeout` padrão). A transação pode ter sido confirmada ou não | reenviar com a **mesma** key: confirmada, volta como replay; não confirmada, é processada |
 
 - **Status do replay:** sai do **resultado gravado**. Para um resultado terminal (200 PROCESSED, 422 REJECTED/FAILED,
   422 `WALLET_NOT_FOUND`), o replay recebe o mesmo status **e** o mesmo corpo da primeira resposta, exceto
@@ -778,6 +784,10 @@ No compose também: `init: true` (tini como PID 1, porque o Nest re-emite o sina
     o intervalo dobra a cada falha seguida (teto de 30 s) e o erro é logado na 1ª falha e depois no máximo uma vez
     a cada 30 s, com o número de falhas suprimidas; a volta é logada uma vez. Antes eram cerca de 27 linhas/s com 3
     réplicas. Prova: [polling-worker.test.ts](test/unit/infrastructure/polling-worker.test.ts).
+  - **ids de rastreio também nos workers:** cada linha reivindicada pelo worker de PENDING_REFERENCE roda num escopo de
+    log próprio (porta `WorkerTracing`), com `transactionId`, `walletId`, `providerId` e `correlationId` dela, inclusive
+    nas linhas de retry da unit of work. A falha de publicação da outbox registra os `eventIds` e `correlationIds` do
+    lote. Prova: "logs do worker de PENDING_REFERENCE" em [observability.test.ts](test/integration/observability.test.ts).
 - **Sem payload financeiro:**
   - os call sites logam ids e status;
   - `redact` mascara `money`/`balance`/`amount`/`body`/`payload`/`data` se alguém logar um objeto inteiro;
@@ -851,18 +861,28 @@ Trocar o guard por essa implementação não altera controllers nem use cases.
 - **Isolamento:** filas exclusivas por teste e ids próprios, sem TRUNCATE.
 - **Concorrência real:** barreira (`inParallel`): todas as operações só disparam quando todas estão
   prontas. Cenários repetidos para exercitar várias intercalações.
-- **`assertLedgerInvariant()` ao fim de cada teste** (`afterEach`, [invariants.ts](test/support/invariants.ts)): saldo
-  armazenado = soma do ledger e `version` = último lançamento, calculados no banco com NUMERIC. Vale para as wallets
-  tocadas pelo teste; nos testes de SQL puro, para toda wallet criada ou alterada desde o início dele.
-- **Guard:** `bun run test` recusa rodar com réplicas do compose no ar, porque publishers e workers delas
-  concorreriam com as medições. `test:multi` sobe as réplicas e as desliga no fim.
+- **`assertLedgerInvariant()` em `afterEach` em todas as suítes com banco** ([invariants.ts](test/support/invariants.ts)):
+  saldo armazenado = soma do ledger e `version` = último lançamento, calculados no banco com NUMERIC. Vale para as
+  wallets que o teste registrou (`touch`); nos testes de SQL puro e de privilégios, para toda wallet criada ou alterada
+  desde o início dele. Como roda no `afterEach`, vale mesmo quando uma asserção do teste falha antes (na v1.0.0, as
+  suítes de concorrência, falha transitória, reconciliação e restart conferiam só no fim do corpo do teste).
+- **Guard** ([setup.ts](test/setup.ts)): `bun run test` recusa rodar com réplicas da app conectadas ao **mesmo banco**,
+  porque publishers e workers delas concorreriam com as medições. A pergunta vai ao próprio banco: as réplicas se
+  identificam com `application_name` `wagering-app:<instância>` em `pg_stat_activity`. A v1.0.0 olhava
+  `localhost:8088`: acusava qualquer stack nessa porta (inclusive de outro projeto) e não via réplicas em outra porta.
+  `test:multi` sobe as réplicas e as desliga no fim.
 - **Timeout:** passado por `--timeout` nos scripts. Um `setDefaultTimeout` no preload só valeria para o
   primeiro arquivo.
 - **Reinício com resposta perdida:** o teste de recuperação reporta quantas transações foram confirmadas
   com a resposta perdida no kill. Numa execução houve 1; o reenvio com a mesma key devolveu replay, sem
   segundo débito.
 
-**Validação a partir de clone limpo (15/10/2026, após as correções da auditoria).** `git clone` num diretório
+**Contagem atual:** `bun run test` = **368 testes** em 28 arquivos; `bun run test:multi` = **8 testes** (o 8º é a queda do
+Postgres, §5.4).
+
+**Validação a partir de clone limpo da v1.0.0 (15/10/2026, após as correções da 1ª auditoria; histórico).** As contagens
+abaixo são as daquele dia; a própria tag v1.0.0 já tinha 331 e 7 testes, porque testes foram acrescentados depois da
+validação e a tabela não foi atualizada (apontado na reauditoria). `git clone` num diretório
 novo e um projeto Compose isolado (`COMPOSE_PROJECT_NAME`), com volume, banco, papéis do Postgres, filas e imagens
 criados do zero, seguindo só o README:
 

@@ -6,7 +6,6 @@ import { afterAll, beforeAll, expect, test } from 'bun:test';
 import type { WagerTransactionOutcome } from '../../src/application/wagering/process-wager-transaction';
 import {
   type AppContext,
-  assertLedgerInvariant,
   countRows,
   createAppContext,
   inParallel,
@@ -14,8 +13,11 @@ import {
   wagerCommand,
   walletBalance,
 } from '../support/app-context';
+import { ledgerInvariantAfterEach } from '../support/invariants';
 
 let instances: AppContext[];
+/** Invariante saldo × ledger no afterEach, para toda wallet registrada com touch() no teste corrente. */
+const touch = ledgerInvariantAfterEach(() => instances[0]!.orm);
 
 beforeAll(async () => {
   instances = await Promise.all([1, 2, 3].map(() => createAppContext({ poolMax: 20 })));
@@ -44,7 +46,7 @@ test('a MESMA aposta enviada 50x em paralelo por 3 instâncias gera exatamente U
   expect(await countRows(a!.orm, `wager_transactions WHERE idempotency_key = ?`, [command.idempotencyKey])).toBe(1);
   expect(await countRows(a!.orm, `wallet_ledger_entries WHERE wallet_id = ? AND direction = 'DEBIT'`, [w.id])).toBe(1);
   expect(await walletBalance(a!.orm, w.id)).toBe('975.00');
-  await assertLedgerInvariant(a!.orm, w.id);
+  touch(w.id); // invariante conferida no afterEach
 });
 
 test('50x a mesma mensagem com payload DIVERGENTE na mesma key: um vence, os outros recebem 409, nenhum efeito extra', async () => {
@@ -59,5 +61,5 @@ test('50x a mesma mensagem com payload DIVERGENTE na mesma key: um vence, os out
   expect(ok.length + conflicts.length).toBe(50);
   expect(ok.length).toBe(25); // exatamente o grupo com o payload que venceu
   expect(await countRows(a!.orm, `wallet_ledger_entries WHERE wallet_id = ? AND direction = 'DEBIT'`, [w.id])).toBe(1);
-  await assertLedgerInvariant(a!.orm, w.id);
+  touch(w.id); // invariante conferida no afterEach
 });

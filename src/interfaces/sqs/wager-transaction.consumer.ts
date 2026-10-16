@@ -46,8 +46,9 @@ export interface ConsumerOptions {
   /** Prazo para concluir mensagens em andamento no shutdown. */
   shutdownGraceMs: number;
   /**
-   * Teto do heartbeat (pior caso × fator, ver config.ts). Depois dele a visibilidade deixa de ser
-   * renovada e a mensagem volta à fila: uma entrega travada não segura o grupo FIFO para sempre.
+   * Teto do heartbeat (pior caso × fator, ver config.ts). A mensagem volta à fila no máximo em
+   * max(visibilityTimeout, teto) depois do início do processamento: uma entrega travada não segura o grupo
+   * FIFO para sempre.
    * A redelivery concorrente é segura (inbox + idempotency key). Sem valor: sem teto.
    */
   maxProcessingMs?: number;
@@ -295,17 +296,21 @@ export class WagerTransactionConsumer {
   private startHeartbeat(message: ReceivedMessage, log: Logger): () => void {
     const visibility = this.options.visibilityTimeoutSeconds;
     const intervalMs = Math.max(1_000, Math.floor((visibility * 1_000) / 3));
-    const maxRenewals =
-      this.options.maxProcessingMs === undefined ? Number.POSITIVE_INFINITY : Math.ceil(this.options.maxProcessingMs / intervalMs);
+    // Prazo ABSOLUTO a partir do início do processamento: a mensagem reaparece no máximo em
+    // max(visibility, teto). Cada renovação pede só o que falta até ele (a 1ª versão renovava o
+    // visibility inteiro a cada vez e a última renovação empurrava a volta para ~180 s com os defaults).
+    const holdMs = this.options.maxProcessingMs === undefined ? Number.POSITIVE_INFINITY : Math.max(visibility * 1_000, this.options.maxProcessingMs);
+    const deadline = performance.now() + holdMs;
     let renewals = 0;
     const timer = setInterval(() => {
-      if (renewals >= maxRenewals) {
+      const remainingSeconds = Math.ceil((deadline - performance.now()) / 1_000);
+      if (remainingSeconds <= 0) {
         clearInterval(timer);
         log.warn({ msg: 'visibility heartbeat cap reached; message will become visible again', renewals, maxProcessingMs: this.options.maxProcessingMs });
         return;
       }
       renewals += 1;
-      this.gateway.changeVisibility(message, visibility).catch((error) => {
+      this.gateway.changeVisibility(message, Math.min(visibility, remainingSeconds)).catch((error) => {
         log.warn({ msg: 'visibility heartbeat failed', err: error });
       });
     }, intervalMs);

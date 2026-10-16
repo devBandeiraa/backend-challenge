@@ -6,11 +6,14 @@
  */
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
-import { assertLedgerInvariant, walletBalance } from '../support/app-context';
+import { walletBalance } from '../support/app-context';
 import { createOwnerOrm, createTestOrm } from '../support/db';
 import { http, parseLogLines, startHttpApp } from '../support/http-app';
+import { ledgerInvariantAfterEach } from '../support/invariants';
 
 let baseUrl: string;
+/** Invariante saldo × ledger no afterEach, para toda wallet registrada com touch() no teste corrente. */
+const touch = ledgerInvariantAfterEach(() => orm);
 let close: () => Promise<void>;
 let orm: MikroORM;
 /** Conexão do OWNER: só ele (superuser no compose de dev) consegue contornar triggers; a app não. */
@@ -72,7 +75,7 @@ describe('POST /wallets/:id/reconciliation', () => {
       walletVersion: 2,
       ledgerVersion: 2,
     });
-    await assertLedgerInvariant(orm, w.id);
+    touch(w.id); // invariante conferida no afterEach
   });
 
   test('divergência forçada no saldo: consistent false, diferença exata, log de erro, métrica; NADA é corrigido', async () => {

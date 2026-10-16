@@ -4,15 +4,17 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
 import {
   type AppContext,
-  assertLedgerInvariant,
   createAppContext,
   inParallel,
   openTestWallet,
   wagerCommand,
   walletBalance,
 } from '../support/app-context';
+import { ledgerInvariantAfterEach } from '../support/invariants';
 
 let instances: AppContext[];
+/** Invariante saldo × ledger no afterEach, para toda wallet registrada com touch() no teste corrente. */
+const touch = ledgerInvariantAfterEach(() => instances[0]!.orm);
 
 beforeAll(async () => {
   instances = await Promise.all([1, 2, 3].map(() => createAppContext({ poolMax: 20 })));
@@ -31,7 +33,7 @@ test('20 wallets × 10 apostas simultâneas (200 operações): cada wallet com o
 
   for (const w of wallets) {
     expect(await walletBalance(a!.orm, w.id)).toBe('30.00');
-    await assertLedgerInvariant(a!.orm, w.id);
+    touch(w.id); // invariante conferida no afterEach
   }
 });
 
@@ -66,6 +68,6 @@ test('wallet A travada não bloqueia a wallet B (lock por wallet, não global)',
   release();
   await holder;
   expect((await pendingA).status).toBe('PROCESSED');
-  await assertLedgerInvariant(a!.orm, walletA.id);
-  await assertLedgerInvariant(a!.orm, walletB.id);
+  touch(walletA.id); // invariante conferida no afterEach
+  touch(walletB.id); // invariante conferida no afterEach
 });

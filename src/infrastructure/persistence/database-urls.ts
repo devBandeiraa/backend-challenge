@@ -6,6 +6,9 @@
  * Os defaults servem para rodar no host contra o Postgres do compose (porta 5442).
  * Lidas na hora (não no import): testes sobem instâncias com variáveis próprias.
  */
+/** application_name das réplicas no Postgres (pg_stat_activity; o guard dos testes do host procura por ele). */
+export const APP_APPLICATION_NAME_PREFIX = 'wagering-app:';
+
 export const appDatabaseUrl = (): string =>
   process.env.DATABASE_URL ?? 'postgresql://wagering_app:wagering_app@localhost:5442/wagering';
 

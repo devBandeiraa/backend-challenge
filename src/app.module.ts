@@ -13,8 +13,10 @@ import { ExponentialBackoff } from './domain/messaging/backoff-policy';
 import { APP_CONFIG, type AppConfig, assertConsumerTiming, loadConfig, maxMessageProcessingMs } from './infrastructure/config';
 import { createSqsClient } from './infrastructure/messaging/sqs/sqs-config';
 import { SQS_GATEWAY, SqsGateway } from './infrastructure/messaging/sqs/sqs-gateway';
+import { enrichContext, runWithContext } from './infrastructure/observability/context';
 import { createLogger, type Logger, PinoNestLogger } from './infrastructure/observability/logger';
 import { AppMetrics, METRICS } from './infrastructure/observability/metrics';
+import { APP_APPLICATION_NAME_PREFIX } from './infrastructure/persistence/database-urls';
 import { buildOrmConfig } from './infrastructure/persistence/mikro-orm.config';
 import { MikroOrmUnitOfWork } from './infrastructure/persistence/mikro-orm-unit-of-work';
 import { isTransientDbError } from './infrastructure/persistence/pg-errors';
@@ -32,8 +34,6 @@ import { WalletsController } from './interfaces/http/wallets.controller';
 import { WagerTransactionConsumer } from './interfaces/sqs/wager-transaction.consumer';
 
 export const LOGGER = Symbol('Logger');
-/** application_name das réplicas no Postgres (o guard dos testes do host procura por ele). */
-export const APP_APPLICATION_NAME_PREFIX = 'wagering-app:';
 export const NEST_LOGGER = Symbol('NestLogger');
 const PENDING_POLICY = Symbol('PendingReferencePolicy');
 
@@ -54,7 +54,10 @@ const useCases = [
   {
     provide: ResolvePendingReferencesUseCase,
     useFactory: (uow: UnitOfWork, clock: Clock, ids: IdGenerator, policy: PendingReferencePolicy) =>
-      new ResolvePendingReferencesUseCase(uow, clock, ids, policy, isTransientDbError),
+      new ResolvePendingReferencesUseCase(uow, clock, ids, policy, isTransientDbError, {
+        run: (fn) => runWithContext({}, fn),
+        annotate: (fields) => enrichContext(fields),
+      }),
     inject: [UNIT_OF_WORK, CLOCK, ID_GENERATOR, PENDING_POLICY],
   },
   { provide: WalletQueries, useFactory: (uow: UnitOfWork) => new WalletQueries(uow), inject: [UNIT_OF_WORK] },
@@ -147,7 +150,10 @@ const messaging = [
               const results = await resolvePending.runOnce(config.pendingReference.batchSize);
               for (const r of results) {
                 metrics.pendingReferenceResolutions.inc({ result: r.status });
-                logger.info({ msg: 'pending reference attempt', transactionId: r.transactionId, status: r.status });
+                // com correlationId/transactionId/walletId/providerId da linha (escopo de log próprio)
+                runWithContext(r.trace ?? { transactionId: r.transactionId }, () =>
+                  logger.info({ msg: 'pending reference attempt', status: r.status }),
+                );
               }
               return results.length;
             },

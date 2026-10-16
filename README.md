@@ -53,9 +53,10 @@ Todos os testes usam **Postgres e LocalStack reais**: não há mock de banco nem
   concorrentes e o SIGTERM numa réplica durante o consumo.
 - **Use `bun run test`, não `bun test` puro:** o script passa `--timeout 60000`, necessário para long
   polling e backoff.
-- **Réplicas no ar:** `bun run test` recusa rodar com as réplicas do compose rodando, porque os publishers
-  e workers delas disputariam as linhas que os testes medem. O `test:multi` desliga as réplicas ao terminar;
-  manualmente: `docker compose stop app nginx`.
+- **Réplicas no ar:** `bun run test` recusa rodar com réplicas da app conectadas ao mesmo banco dos testes (detectadas
+  pelo `application_name` em `pg_stat_activity`, qualquer que seja a porta), porque os publishers e workers delas
+  disputariam as linhas que os testes medem. O `test:multi` desliga as réplicas ao terminar; manualmente:
+  `docker compose stop app nginx`.
 
 ## API
 
@@ -93,6 +94,8 @@ curl -s -X POST localhost:8088/wagering/transactions -H 'content-type: applicati
 - **409:** conflito de idempotência ou wallet duplicada.
 - **422:** rejeição de negócio, com `failureCode`.
 - **503:** falha transitória, com `Retry-After`; reenvie com a **mesma** key.
+- **502 / 504** (do nginx, não da app): a réplica caiu no meio da requisição ou não respondeu em 60 s. A transação pode
+  ter sido confirmada ou não; reenvie com a **mesma** key (confirmada, volta como replay).
 
 O replay de um resultado terminal (200/422) devolve o mesmo status e o mesmo corpo da primeira resposta. Um 202
 continua 202 enquanto a referência não chega; depois que o worker resolve a transação, o replay devolve o desfecho
@@ -182,7 +185,7 @@ docker/            Dockerfiles, nginx
 
 - **Docker Desktop parado:** "failed to connect to the docker API" significa que é preciso abrir o Docker Desktop.
 - **Porta ocupada:** troque o mapeamento no `docker-compose.yml` e ajuste `DATABASE_URL` / `SQS_ENDPOINT`.
-- **`bun run test` falha com "app replicas are running":** rode `docker compose stop app nginx`.
+- **`bun run test` falha com "app replicas are connected to the test database":** rode `docker compose stop app nginx`.
 - **`ECONNRESET` aos 30 s chamando `localhost:8088` no Windows:** é o proxy de portas do Docker Desktop, não
   a aplicação. A requisição não chega ao nginx. Reenvie com a mesma Idempotency-Key. O teste de carga mede
   de dentro da rede do compose por isso

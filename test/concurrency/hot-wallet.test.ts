@@ -5,7 +5,6 @@ import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { WagerTransactionOutcome } from '../../src/application/wagering/process-wager-transaction';
 import {
   type AppContext,
-  assertLedgerInvariant,
   countRows,
   createAppContext,
   inParallel,
@@ -13,8 +12,11 @@ import {
   wagerCommand,
   walletBalance,
 } from '../support/app-context';
+import { ledgerInvariantAfterEach } from '../support/invariants';
 
 let instances: AppContext[];
+/** Invariante saldo × ledger no afterEach, para toda wallet registrada com touch() no teste corrente. */
+const touch = ledgerInvariantAfterEach(() => instances[0]!.orm);
 
 beforeAll(async () => {
   instances = await Promise.all([1, 2, 3].map(() => createAppContext({ poolMax: 20 })));
@@ -50,7 +52,7 @@ describe('cenário obrigatório: saldo 100.00, duas apostas de 80.00 simultânea
     expect(retries.every((r) => r.idempotentReplay)).toBe(true);
     expect(retries.map((r) => r.status).sort()).toEqual(outcomes.map((o) => o.status).sort());
     expect(await countRows(a!.orm, `wallet_ledger_entries WHERE wallet_id = ? AND direction = 'DEBIT'`, [w.id])).toBe(1);
-    await assertLedgerInvariant(a!.orm, w.id);
+    touch(w.id); // invariante conferida no afterEach
   });
 });
 
@@ -70,7 +72,7 @@ describe('hot wallet', () => {
     // saldo observado de cada aposta aceita é único (cada uma viu uma versão diferente)
     const seen = outcomes.filter((o) => o.status === 'PROCESSED').map((o) => o.balance!.amount);
     expect(new Set(seen).size).toBe(150);
-    await assertLedgerInvariant(a!.orm, w.id);
+    touch(w.id); // invariante conferida no afterEach
   });
 
   test('BET e WIN misturados em paralelo: saldo final = inicial − apostas aceitas + prêmios', async () => {
@@ -92,7 +94,7 @@ describe('hot wallet', () => {
     });
     expect(await walletBalance(a!.orm, w.id)).toBe((expectedCents / 100).toFixed(2));
     expect(outcomes.every((o) => o.status === 'PROCESSED' || o.failureCode === 'INSUFFICIENT_FUNDS')).toBe(true);
-    await assertLedgerInvariant(a!.orm, w.id);
+    touch(w.id); // invariante conferida no afterEach
   });
 
   test('REFUND e ROLLBACK da MESMA BET em paralelo: só uma reversão vence (decisão B)', async () => {
@@ -108,7 +110,7 @@ describe('hot wallet', () => {
       expect(outcomes.filter((o) => o.status === 'PROCESSED')).toHaveLength(1);
       expect(outcomes.filter((o) => o.failureCode === 'REFERENCE_ALREADY_REVERSED')).toHaveLength(3);
       expect(await walletBalance(a!.orm, w.id)).toBe('100.00');
-      await assertLedgerInvariant(a!.orm, w.id);
+      touch(w.id); // invariante conferida no afterEach
     }
   });
 });

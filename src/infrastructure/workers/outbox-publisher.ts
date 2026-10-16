@@ -87,7 +87,14 @@ export class OutboxPublisher {
         this.metrics.outboxPublished.inc(published.length);
         if (failures.size > 0) {
           this.metrics.outboxPublishFailures.inc(failures.size);
-          this.logger.warn({ msg: 'outbox publish failed; rescheduled', count: failures.size });
+          const failed = rows.filter((r) => failures.has(r.id));
+          this.logger.warn({
+            msg: 'outbox publish failed; rescheduled',
+            count: failures.size,
+            // rastreio sem payload: ids dos eventos e correlationIds (no máximo 20)
+            eventIds: failed.slice(0, 20).map((r) => r.id),
+            correlationIds: [...new Set(failed.map((r) => r.correlationId))].slice(0, 20),
+          });
         }
         return { published: published.length, failed: failures.size };
       },

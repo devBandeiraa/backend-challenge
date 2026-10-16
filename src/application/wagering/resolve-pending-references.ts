@@ -7,7 +7,28 @@ import { DEFAULT_PENDING_REFERENCE_POLICY, type PendingReferencePolicy, Transact
 export interface ResolveResult {
   transactionId: string;
   status: string;
+  /** Ids de rastreio da linha (para quem registra o desfecho fora do escopo). */
+  trace?: TraceFields;
 }
+
+/** Ids de rastreio de uma linha reivindicada (vão para todas as linhas de log do processamento dela). */
+export interface TraceFields {
+  transactionId: string;
+  walletId: string;
+  providerId: string;
+  correlationId: string;
+}
+
+/**
+ * Porta de rastreio: `run` abre um escopo de log por linha e `annotate` acrescenta os ids assim que a linha é
+ * reivindicada. Implementada na infraestrutura (AsyncLocalStorage); sem ela, nada é rastreado.
+ */
+export interface WorkerTracing {
+  run<T>(fn: () => Promise<T>): Promise<T>;
+  annotate(fields: TraceFields): void;
+}
+
+const NO_TRACING: WorkerTracing = { run: (fn) => fn(), annotate: () => undefined };
 
 /**
  * Reprocessa transações PENDING_REFERENCE vencidas. Cada uma numa transação SQL própria:
@@ -33,6 +54,7 @@ export class ResolvePendingReferencesUseCase {
     ids: IdGenerator,
     policy: PendingReferencePolicy = DEFAULT_PENDING_REFERENCE_POLICY,
     private readonly isTransient: (error: unknown) => boolean = () => false,
+    private readonly tracing: WorkerTracing = NO_TRACING,
   ) {
     this.settler = new TransactionSettler(clock, ids, policy);
   }
@@ -41,17 +63,30 @@ export class ResolvePendingReferencesUseCase {
   async runOnce(limit: number): Promise<ResolveResult[]> {
     const results: ResolveResult[] = [];
     for (let i = 0; i < limit; i++) {
+      const result = await this.tracing.run(() => this.resolveOne());
+      if (!result) break;
+      results.push(result);
+    }
+    return results;
+  }
+
+  /** Uma linha, num escopo de rastreio próprio (os ids entram assim que ela é reivindicada). */
+  private async resolveOne(): Promise<ResolveResult | undefined> {
+    {
       let claimedId: string | undefined;
+      let trace: TraceFields | undefined;
       let result: ResolveResult | undefined;
       try {
         result = await this.uow.run(async (scope) => {
           const tx = await scope.transactions.claimDuePendingReference(this.clock.now());
           if (!tx) return undefined;
           claimedId = tx.id;
+          trace = { transactionId: tx.id, walletId: tx.walletId, providerId: tx.providerId, correlationId: tx.correlationId };
+          this.tracing.annotate(trace);
           const wallet = await scope.wallets.lockById(tx.walletId);
           if (!wallet) throw new Error(`wallet ${tx.walletId} vanished`); // impossível: sem DELETE
           await this.settler.settle(scope, tx, wallet, { correlationId: tx.correlationId, causationId: tx.id });
-          return { transactionId: tx.id, status: tx.status };
+          return { transactionId: tx.id, status: tx.status, trace };
         });
       } catch (error) {
         const permanent =
@@ -60,12 +95,10 @@ export class ResolvePendingReferencesUseCase {
           !(error instanceof ApplicationError) &&
           !this.isTransient(error);
         if (!permanent) throw error;
-        result = { transactionId: claimedId!, status: await this.markFailed(claimedId!) };
+        result = { transactionId: claimedId!, status: await this.markFailed(claimedId!), ...(trace ? { trace } : {}) };
       }
-      if (!result) break;
-      results.push(result);
+      return result;
     }
-    return results;
   }
 
   private markFailed(transactionId: string): Promise<string> {

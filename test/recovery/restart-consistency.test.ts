@@ -7,13 +7,16 @@
 import { afterAll, beforeAll, expect, test } from 'bun:test';
 import type { Subprocess } from 'bun';
 import type { MikroORM } from '@mikro-orm/postgresql';
-import { assertLedgerInvariant, barrier, countRows, walletBalance } from '../support/app-context';
+import { barrier, countRows, walletBalance } from '../support/app-context';
 import { createTestOrm } from '../support/db';
 import { createTestQueues, type SqsGateway, waitFor, wagerMessage } from '../support/sqs';
+import { ledgerInvariantAfterEach } from '../support/invariants';
 
 const PORT = 3900 + Math.floor(Math.random() * 90);
 const BASE_URL = `http://127.0.0.1:${PORT}`;
 let orm: MikroORM;
+/** Invariante saldo × ledger no afterEach, para toda wallet registrada com touch() no teste corrente. */
+const touch = ledgerInvariantAfterEach(() => orm);
 let gateway: SqsGateway;
 let names: { input: string; deadLetter: string; events: string };
 let proc: Subprocess | undefined;
@@ -177,7 +180,7 @@ test('kill -9 no meio da carga → restart → reenvio com as mesmas keys → co
   for (const w of wallets) {
     expect(await walletBalance(orm, w.id)).toBe('958.00'); // 1000 − 30×1 − 6×2 − 5 + 5
     expect(await countRows(orm, `wallet_ledger_entries WHERE wallet_id = ?`, [w.id])).toBe(1 + 30 + 6 + 2);
-    await assertLedgerInvariant(orm, w.id);
+    touch(w.id); // invariante conferida no afterEach
   }
   // nenhuma transação ficou presa; cada key existe exatamente uma vez
   expect(await countRows(orm, `wager_transactions WHERE wallet_id = ANY(?::uuid[]) AND status IN ('PENDING','PENDING_REFERENCE')`, [`{${wallets.map((w) => w.id).join(',')}}`])).toBe(0);

@@ -7,10 +7,13 @@
 import { afterAll, beforeAll, describe, expect, test } from 'bun:test';
 import type { MikroORM } from '@mikro-orm/postgresql';
 import { createTestOrm } from '../support/db';
+import { ledgerInvariantSinceTestStart } from '../support/invariants';
 
 let orm: MikroORM;
 const uuid = () => crypto.randomUUID();
 const INSUFFICIENT_PRIVILEGE = '42501';
+// Nenhum teste aqui deveria mexer em saldo; se mexer, a invariante acusa.
+ledgerInvariantSinceTestStart(() => orm);
 
 beforeAll(async () => {
   orm = await createTestOrm(2);

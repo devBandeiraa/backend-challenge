@@ -8,11 +8,13 @@ import type { MikroORM } from '@mikro-orm/postgresql';
 import { TransientInfrastructureError } from '../../src/application/errors';
 import { MikroOrmUnitOfWork } from '../../src/infrastructure/persistence/mikro-orm-unit-of-work';
 import { sqlStateOf } from '../../src/infrastructure/persistence/pg-errors';
-import { assertLedgerInvariant } from '../support/app-context';
 import { createTestOrm } from '../support/db';
 import { http, startHttpApp } from '../support/http-app';
+import { ledgerInvariantAfterEach } from '../support/invariants';
 
 let orm: MikroORM;
+/** Invariante saldo × ledger no afterEach, para toda wallet registrada com touch() no teste corrente. */
+const touch = ledgerInvariantAfterEach(() => orm);
 let baseUrl: string;
 let close: () => Promise<void>;
 const MAX_ATTEMPTS = 3;
@@ -75,7 +77,7 @@ test('lock segurado além do lock_timeout → retries medidos → 503 com Retry-
   const retry = await http(baseUrl, 'POST', '/wagering/transactions', { body, headers });
   expect(retry.status).toBe(200);
   expect(retry.body).toMatchObject({ status: 'PROCESSED', balance: { amount: '90.00' }, idempotentReplay: false });
-  await assertLedgerInvariant(orm, wallet.id);
+  touch(wallet.id); // invariante conferida no afterEach
 });
 
 /** EntityManager da transação corrente (os repositórios o guardam): só para executar SQL arbitrário no teste. */
@@ -116,5 +118,5 @@ test('lock da wallet é isento do statement_timeout (fila de hot wallet), mas o 
     .catch((e: unknown) => e);
   expect(seen).toEqual(['300ms']);
   expect(sqlStateOf((error as TransientInfrastructureError).cause)).toBe('57014');
-  await assertLedgerInvariant(orm, wallet.id);
+  touch(wallet.id); // invariante conferida no afterEach
 });

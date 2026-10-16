@@ -170,3 +170,45 @@ describe('health e métricas', () => {
     }
   });
 });
+
+describe('logs do worker de PENDING_REFERENCE', () => {
+  test('cada tentativa sai com transactionId, walletId, providerId e correlationId da linha; sem valores', async () => {
+    const workerLines: string[] = [];
+    const worker = await startHttpApp({
+      env: { APP_ROLES: 'http,pending-reference', PENDING_REFERENCE_INTERVAL_MS: '50', PENDING_REFERENCE_BASE_DELAY_MS: '50', LOG_LEVEL: 'info' },
+      logLines: workerLines,
+    });
+    try {
+      const w = (await http(worker.baseUrl, 'POST', '/wallets', { body: { playerId: crypto.randomUUID(), initialBalance: { amount: '765.43', currency: 'BRL' } } })).body;
+      touch(w.id);
+      const base = { providerId: 'provider-worker-obs', playerId: w.playerId, walletId: w.id, roundId: 'r', gameId: 'g' };
+      const betExt = `obs-bet-${crypto.randomUUID()}`;
+      const refundExt = `obs-ref-${crypto.randomUUID()}`;
+      const refund = await http(worker.baseUrl, 'POST', '/wagering/transactions', {
+        headers: { 'idempotency-key': `provider-worker-obs:${refundExt}`, 'x-correlation-id': 'corr-worker-obs' },
+        body: { ...base, externalTransactionId: refundExt, kind: 'REFUND', money: { amount: '54.32', currency: 'BRL' }, referenceExternalTransactionId: betExt },
+      });
+      expect(refund.status).toBe(202);
+      await http(worker.baseUrl, 'POST', '/wagering/transactions', {
+        headers: { 'idempotency-key': `provider-worker-obs:${betExt}` },
+        body: { ...base, externalTransactionId: betExt, kind: 'BET', money: { amount: '54.32', currency: 'BRL' } },
+      });
+
+      const attempt = await waitFor(
+        async () =>
+          parseLogLines(workerLines).find((l) => l.msg === 'pending reference attempt' && l.transactionId === refund.body.transactionId && l.status === 'PROCESSED'),
+        15_000,
+        100,
+      );
+      expect(attempt).toMatchObject({
+        transactionId: refund.body.transactionId,
+        walletId: w.id,
+        providerId: 'provider-worker-obs',
+        correlationId: 'corr-worker-obs',
+      });
+      assertNoFinancialPayload(parseLogLines(workerLines), ['765.43', '54.32']);
+    } finally {
+      await worker.close();
+    }
+  }, 30_000);
+});

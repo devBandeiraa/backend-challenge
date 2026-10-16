@@ -9,7 +9,6 @@ import { createLogger } from '../../src/infrastructure/observability/logger';
 import { WagerTransactionConsumer } from '../../src/interfaces/sqs/wager-transaction.consumer';
 import {
   type AppContext,
-  assertLedgerInvariant,
   countRows,
   createAppContext,
   messageData,
@@ -18,8 +17,11 @@ import {
   walletBalance,
 } from '../support/app-context';
 import { createTestQueues, drain, type SqsGateway, waitFor, wagerMessage } from '../support/sqs';
+import { ledgerInvariantAfterEach } from '../support/invariants';
 
 let app: AppContext;
+/** Invariante saldo × ledger no afterEach, para toda wallet registrada com touch() no teste corrente. */
+const touch = ledgerInvariantAfterEach(() => app.orm);
 let queues: Awaited<ReturnType<typeof createTestQueues>>;
 let gateway: SqsGateway;
 let client: SQSClient;
@@ -83,5 +85,5 @@ test('commit confirmado, processo morre antes do ack → redelivery → inbox ev
   expect(await countRows(app.orm, `wallet_ledger_entries WHERE wallet_id = ? AND direction = 'DEBIT'`, [w.id])).toBe(1);
   expect(await drain(client, gateway.urls.input, 500)).toHaveLength(0);
   expect(await drain(client, gateway.urls.deadLetter, 300)).toHaveLength(0);
-  await assertLedgerInvariant(app.orm, w.id);
+  touch(w.id); // invariante conferida no afterEach
 });

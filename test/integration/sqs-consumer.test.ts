@@ -11,7 +11,7 @@ import { type ConsumerOptions, WagerTransactionConsumer } from '../../src/interf
 import { type AppContext, countRows, createAppContext, messageData, openTestWallet, wagerCommand, walletBalance } from '../support/app-context';
 import { ledgerInvariantAfterEach } from '../support/invariants';
 import { createTestQueues, drain, type SqsGateway, waitFor, wagerMessage } from '../support/sqs';
-import type { SQSClient } from '@aws-sdk/client-sqs';
+import { DeleteMessageCommand, ReceiveMessageCommand, type SQSClient } from '@aws-sdk/client-sqs';
 
 let app: AppContext;
 let gateway: SqsGateway;
@@ -549,4 +549,58 @@ describe('ordem FIFO do grupo', () => {
     const heldBehind = (await app.metrics.sqsMessages.get()).values.find((v) => v.labels.outcome === 'held_behind')?.value ?? 0;
     expect(heldBehind).toBeGreaterThanOrEqual(1); // a BET2 foi devolvida atrás da BET1, não processada fora de ordem
   }, 60_000);
+});
+
+describe('teto do heartbeat: prazo absoluto', () => {
+  test('a mensagem presa reaparece em max(visibility, teto) após o início do processamento, não depois', async () => {
+    const w = await wallet('100.00');
+    const cmd = wagerCommand(w, { money: { amount: '10.00', currency: 'BRL' } });
+    const slowApp = await createAppContext({ poolMax: 4, uow: { maxAttempts: 1, lockTimeoutMs: 20_000 } });
+    let release!: () => void;
+    const released = new Promise<void>((r) => (release = r));
+    let locked!: () => void;
+    const isLocked = new Promise<void>((r) => (locked = r));
+    const holder = app.orm.em.fork().transactional(async (em) => {
+      await em.execute(`SELECT id FROM wallets WHERE id = ? FOR NO KEY UPDATE`, [w.id]);
+      locked();
+      await released;
+    });
+    await isLocked;
+    await send(wagerMessage(messageData(cmd)).body, w.id);
+
+    // visibility 2 s, teto 5 s: o heartbeat estende até 5 s e PARA ali (a 1ª versão renovava 2 s inteiros
+    // a cada segundo, 5 vezes, e a mensagem só voltava em ~7 s)
+    const a = new WagerTransactionConsumer(gateway, slowApp.processTransaction, new AppMetrics(), logger, {
+      consumerName: 'heartbeat-deadline',
+      maxAttempts: 3,
+      waitTimeSeconds: 1,
+      visibilityTimeoutSeconds: 2,
+      batchSize: 10,
+      shutdownGraceMs: 20_000,
+      maxProcessingMs: 5_000,
+    });
+    a.start();
+    // início do processamento: a entrega de A está esperando o lock da wallet
+    await waitFor(async () => (await countRows(app.orm, `pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%wallet-lock-wait%'`, [])) >= 1 || undefined, 15_000, 20);
+    const startedAt = performance.now();
+    let reappearedAfterMs: number | undefined;
+    let receipt: string | undefined;
+    while (performance.now() - startedAt < 12_000) {
+      const res = await client.send(new ReceiveMessageCommand({ QueueUrl: gateway.urls.input, MaxNumberOfMessages: 1, WaitTimeSeconds: 1, VisibilityTimeout: 30 }));
+      if (res.Messages?.length) {
+        reappearedAfterMs = performance.now() - startedAt;
+        receipt = res.Messages[0]!.ReceiptHandle;
+        break;
+      }
+    }
+    release();
+    await holder;
+    await a.stop();
+    if (receipt) await client.send(new DeleteMessageCommand({ QueueUrl: gateway.urls.input, ReceiptHandle: receipt }));
+    await slowApp.close();
+
+    expect(reappearedAfterMs).toBeDefined();
+    expect(reappearedAfterMs!).toBeGreaterThan(3_500); // o heartbeat de fato estendeu além dos 2 s
+    expect(reappearedAfterMs!).toBeLessThan(6_200); // e não passou do teto de 5 s (+ margem do poll de 1 s)
+  }, 45_000);
 });
