@@ -877,7 +877,7 @@ Trocar o guard por essa implementação não altera controllers nem use cases.
   com a resposta perdida no kill. Numa execução houve 1; o reenvio com a mesma key devolveu replay, sem
   segundo débito.
 
-**Contagem atual:** `bun run test` = **368 testes** em 28 arquivos; `bun run test:multi` = **8 testes** (o 8º é a queda do
+**Contagem atual:** `bun run test` = **369 testes** em 28 arquivos (o 369º é o contrato do contorno do ROLLBACK, §15); `bun run test:multi` = **8 testes** (o 8º é a queda do
 Postgres, §5.4).
 
 **Validação a partir de clone limpo da v1.0.1 (16/10/2026, depois das correções da reauditoria).** `git clone` do branch
@@ -889,7 +889,7 @@ o README:
 | `bun install --frozen-lockfile` | 179 pacotes, lockfile respeitado |
 | `bun run infra:up` | 9 migrations; `wagering_app` e `wagering_app_rw` sem superuser; filas criadas |
 | `bun run typecheck` | sem erros |
-| `bun run test` | **368 pass, 0 fail** |
+| `bun run test` | **368 pass, 0 fail** (commit `4e4b3d1`; o teste de contrato do §15 veio depois e roda no `test:all` do commit que o adicionou) |
 | `bun run test:multi` | **8 pass, 0 fail**; queda do Postgres: 3 réplicas ready 0,9 s depois de ele ficar healthy, só 503 durante a queda; SIGTERM: 30 mensagens em 426 ms |
 | `bun run test:load` (30 s, 50 clientes) | 200,1 req/s, p50 132 ms, p99 1,95 s, 0 erros 5xx ou de rede; 0 divergências, 0 lançamentos duplicados, 0 saldos negativos em 201 wallets |
 
@@ -988,6 +988,41 @@ Dependências fixadas em versões publicadas há pelo menos 2 semanas.
 
 ## 15. Limitações e próximos passos
 
+- **⚠️ O contorno do ROLLBACK em conexão morta depende de um campo INTERNO do `pg`** (§5.4,
+  [pg-pool-resilience.ts](src/infrastructure/persistence/pg-pool-resilience.ts)).
+  - **O que depende:** para saber que a conexão de um cliente caiu, o guard lê `client._queryable`, campo não documentado
+    do `pg` (o próprio `pg-pool` o usa para descartar clientes no release). Com ele, ROLLBACK/BEGIN num cliente quebrado
+    viram no-op, e o Kysely devolve a conexão ao pool. A causa é do Kysely (`ControlledTransaction.rollback()` só libera a
+    conexão depois de um ROLLBACK bem-sucedido; um BEGIN que falha também não a libera), não da aplicação.
+  - **Versões em que foi verificado:** `pg` 8.23.0, `pg-pool` 3.14.0, `kysely` 0.29.6 (dependências transitivas fixadas
+    pelo `bun.lock`; o README instala com `--frozen-lockfile`), sob `@mikro-orm/postgresql` 7.2.3 (fixado no
+    `package.json`).
+  - **O teste que detectaria a quebra:** "contrato do contorno do ROLLBACK em conexão morta (pg + guard)" em
+    [connection-failures.test.ts](test/integration/connection-failures.test.ts). Ele derruba a conexão real de um cliente
+    do pool e exige que `_queryable` seja `true` antes e `false` depois, que ROLLBACK e BEGIN resolvam e que COMMIT
+    rejeite. Por mutação, falha se o guard for desligado ou se ler outro nome de campo. O e2e "queda do Postgres" cobre o
+    efeito ponta a ponta (réplicas voltam a ready sem reinício), mas é lento e não aponta a causa.
+  - **Ao atualizar `pg`, `kysely` ou o MikroORM:** rodar esse teste primeiro. Se o Kysely passar a liberar a conexão
+    quando o ROLLBACK falha, o contorno vira redundante e pode sair; o caminho sem campo interno seria capturar o evento
+    `'error'` do cliente (já registrado no `onPoolCreated`) e marcar o cliente quebrado num `WeakSet` próprio.
+- **⚠️ O schema ainda aceita transação PROCESSED sem lançamento** (reauditoria, B4).
+  - **A lacuna:** o WL005 (migration 009) garante que todo lançamento corresponde a uma transação PROCESSED que move saldo,
+    e o WL004 garante saldo = último lançamento. A direção inversa não é imposta: uma BET/WIN/REFUND/ROLLBACK/OPENING
+    `PROCESSED` sem lançamento, com a wallet intacta, passa até pelas verificações deferred. A credencial da app tem
+    `INSERT` em `wager_transactions` com qualquer status (necessário para o OPENING já PROCESSED e para o FAILED do
+    consumer), então só um bug, ou alguém com essa credencial, produziria esse estado. A reconciliação não o detecta,
+    porque compara wallet × ledger, não transação × ledger. Verificado na reauditoria com SQL direto (`GAP-COMMIT`).
+  - **No código atual não acontece:** `TransactionSettler` grava transação, wallet e lançamento na mesma transação SQL
+    ([atomicity.test.ts](test/integration/atomicity.test.ts)). Na reauditoria, uma carga mista com `kill -9` e outra com
+    queda do Postgres (scripts fora do repositório) contaram 0 transações PROCESSED sem exatamente um lançamento.
+  - **Mitigação proposta (migration 010, não implementada nesta versão):** uma constraint trigger
+    `DEFERRABLE INITIALLY DEFERRED`, `AFTER INSERT OR UPDATE OF status ON wager_transactions`, que no COMMIT exige
+    `EXISTS (SELECT 1 FROM wallet_ledger_entries WHERE transaction_id = NEW.id)` quando `NEW.status = 'PROCESSED'` e
+    `NEW.kind <> 'LOSS'` (SQLSTATE próprio, ex.: `WL006`). Precisa ser deferred porque o caso de uso marca a transação
+    PROCESSED **antes** de inserir o lançamento (o WL005 exige essa ordem). Custo: uma busca por transação no COMMIT, pelo
+    índice de `le_transaction_wallet_uq` (`transaction_id` é a 1ª coluna). Teste junto: SQL puro em
+    [schema-constraints.test.ts](test/integration/schema-constraints.test.ts) com BET PROCESSED sem lançamento → `WL006`
+    no COMMIT, e LOSS PROCESSED sem lançamento → aceito.
 - **Hot wallet:** as transações em espera de lock seguram conexões do pool (seção 13). Mitigações
   candidatas, com custo: fila por walletId em cada instância; rotear hot wallets pela FIFO; `lock_timeout`
   curto só para o lock da wallet.

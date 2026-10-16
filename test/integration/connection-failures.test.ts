@@ -7,7 +7,7 @@
  *  - worker de PENDING_REFERENCE: a linha continua pendente (NUNCA FAILED) e é resolvida depois.
  */
 import { afterAll, afterEach, beforeAll, describe, expect, test } from 'bun:test';
-import type { MikroORM } from '@mikro-orm/postgresql';
+import { MikroORM } from '@mikro-orm/postgresql';
 import type { TransactionScope, UnitOfWork } from '../../src/application/ports';
 import { ProcessWagerTransactionUseCase } from '../../src/application/wagering/process-wager-transaction';
 import { ResolvePendingReferencesUseCase } from '../../src/application/wagering/resolve-pending-references';
@@ -16,10 +16,11 @@ import { AppMetrics } from '../../src/infrastructure/observability/metrics';
 import { isTransientDbError } from '../../src/infrastructure/persistence/pg-errors';
 import { SystemClock, UuidV7Generator } from '../../src/infrastructure/system';
 import { createLogger } from '../../src/infrastructure/observability/logger';
+import { buildOrmConfig } from '../../src/infrastructure/persistence/mikro-orm.config';
 import { LOCK_WAIT_MARKER } from '../../src/infrastructure/persistence/pg-pool-resilience';
 import { WagerTransactionConsumer } from '../../src/interfaces/sqs/wager-transaction.consumer';
 import { type AppContext, createAppContext, countRows, messageData, openTestWallet, wagerCommand, walletBalance } from '../support/app-context';
-import { createOwnerOrm } from '../support/db';
+import { createOwnerOrm, TEST_DATABASE_URL } from '../support/db';
 import { http, startHttpApp } from '../support/http-app';
 import { ledgerInvariantAfterEach } from '../support/invariants';
 import { createTestQueues, wagerMessage, waitFor } from '../support/sqs';
@@ -297,4 +298,39 @@ describe('erro de conexão SEM SQLSTATE ("not queryable") entre instruções', (
     expect(resolved?.status).toBe('PROCESSED');
     expect(await walletBalance(app.orm, w.id)).toBe('100.00');
   }, 60_000);
+});
+
+
+/**
+ * Contrato de que depende o contorno de pg-pool-resilience.ts (limitação documentada no ARCHITECTURE §15):
+ *  (a) o cliente `pg` expõe o campo INTERNO `_queryable`, `true` com a conexão viva e `false` depois que ela cai;
+ *  (b) nesse cliente quebrado, o guard transforma ROLLBACK/BEGIN em no-op e NUNCA simula COMMIT.
+ * Se uma atualização do pg renomear o campo, ou o guard deixar de agir, este teste falha antes de a réplica voltar a
+ * vazar conexões numa queda real do Postgres (cenário coberto pelo e2e "queda do Postgres").
+ */
+describe('contrato do contorno do ROLLBACK em conexão morta (pg + guard)', () => {
+  test('_queryable vira false quando a conexão cai; ROLLBACK/BEGIN resolvem, COMMIT rejeita', async () => {
+    const orm = await MikroORM.init(buildOrmConfig({ clientUrl: TEST_DATABASE_URL, poolMax: 1, applicationName: 'wagering-test-contract' }));
+    type GuardedClient = { _queryable?: boolean; query(sql: string): Promise<{ command?: string }>; release(error?: Error): void };
+    try {
+      const pool = (await (orm.em.getConnection() as unknown as { getNativeClient(): Promise<unknown> }).getNativeClient()) as {
+        connect(): Promise<GuardedClient>;
+      };
+      const client = await pool.connect(); // novo cliente: passa pelo 'connect' do pool, onde o guard é instalado
+      const { rows } = (await client.query('SELECT pg_backend_pid() AS pid')) as unknown as { rows: { pid: number }[] };
+      expect(client._queryable).toBe(true); // (a) o campo existe e reflete a conexão viva
+
+      await owner.em.fork().execute('SELECT pg_terminate_backend(?)', [rows[0]!.pid]);
+      await waitFor(async () => client._queryable === false || undefined, 5_000, 20); // (a) e cai para false
+
+      // (b) no-op nos comandos que o Kysely precisa ver bem-sucedidos para devolver a conexão ao pool
+      expect((await client.query('ROLLBACK')).command).toBe('ROLLBACK');
+      expect((await client.query('start transaction isolation level read committed')).command).toBe('START');
+      // COMMIT jamais é simulado: confirmar sem o servidor seria mentir sobre durabilidade
+      await expect(client.query('COMMIT')).rejects.toThrow(/not queryable/);
+      client.release(new Error('broken connection'));
+    } finally {
+      await orm.close(true);
+    }
+  }, 30_000);
 });
