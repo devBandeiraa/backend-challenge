@@ -684,7 +684,10 @@ No compose também: `init: true` (tini como PID 1, porque o Nest re-emite o sina
   processa em menos de 5 s, contra 30 s de visibility no teste) e "stop() conclui a mensagem em andamento";
 - [consumer-timing.test.ts](test/unit/infrastructure/consumer-timing.test.ts): o cálculo do prazo de shutdown;
 - e2e "SIGTERM durante o long poll": SIGTERM numa réplica ociosa e 30 mensagens logo em seguida; todas processadas
-  em menos de 20 s (mensagem presa levaria 90 s), com a contagem do que a vítima devolveu. `bun run test:multi`
+  em menos de 20 s (mensagem presa levaria 90 s), com a contagem do que a vítima devolveu. O envio e a medição rodam
+  **dentro da rede do compose**, por outra réplica ([in-network-sender.ts](test/e2e/in-network-sender.ts) via `docker exec`):
+  numa execução da reauditoria, o proxy de portas do Docker Desktop segurou um `SendMessage` do host por 30 s e o teste
+  mediu o ambiente, não a aplicação. `bun run test:multi`
   5 vezes seguidas (15/10/2026), todas com 7 pass:
 
   | Execução | `bun test` | total (com build e subida) | 30 mensagens processadas em | devolvidas pela vítima |

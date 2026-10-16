@@ -239,24 +239,41 @@ describe('SQS consumido por 3 consumers concorrentes', () => {
       keys.push(body.idempotencyKey);
       return body;
     });
+    // Envio e medição DENTRO da rede do compose, por outra réplica: o proxy de portas do Docker Desktop (host)
+    // pode segurar um SendMessage por 30 s e a medição passaria a medir o ambiente, não a aplicação.
+    const [victim = '', helper] = new TextDecoder().decode(Bun.spawnSync(['docker', 'compose', 'ps', '-q', 'app']).stdout).trim().split('\n');
+    expect(helper).toBeDefined();
+    const sender = Bun.spawn(['docker', 'exec', '-i', helper!, 'bun', '-e', await Bun.file('test/e2e/in-network-sender.ts').text()], {
+      stdin: 'pipe',
+      stdout: 'pipe',
+      stderr: 'pipe',
+    });
+    const lines = (async function* () {
+      const decoder = new TextDecoder();
+      let buffer = '';
+      for await (const chunk of sender.stdout) {
+        buffer += decoder.decode(chunk);
+        let nl: number;
+        while ((nl = buffer.indexOf('\n')) >= 0) {
+          const line = buffer.slice(0, nl);
+          buffer = buffer.slice(nl + 1);
+          if (line.startsWith('{')) yield JSON.parse(line) as { phase: string; allProcessedMs?: number; processed?: number };
+        }
+      }
+    })();
+    sender.stdin.write(`${JSON.stringify({ queue: DEFAULT_QUEUE_NAMES.input, messages: bodies.map((b) => ({ body: wagerMessage(b).body, groupId: b.walletId })), keys })}\n`);
+    expect((await lines.next()).value?.phase).toBe('ready');
+
     // réplicas ociosas: as três estão bloqueadas num long poll (SQS_WAIT_TIME_SECONDS=5)
-    const victim = new TextDecoder().decode(Bun.spawnSync(['docker', 'compose', 'ps', '-q', 'app']).stdout).trim().split('\n')[0]!;
     const killedAt = new Date().toISOString();
     expect(Bun.spawnSync(['docker', 'kill', '--signal', 'SIGTERM', victim]).exitCode).toBe(0);
-    const sentAt = performance.now();
     // chegam enquanto o long poll da vítima ainda está aberto (ele não é abortado)
-    await Promise.all(bodies.map((b) => gateway.sendToInput(wagerMessage(b).body, b.walletId, crypto.randomUUID())));
-
-    await waitFor(async () => {
-      const [row] = await orm.em
-        .fork()
-        .execute<{ n: string }[]>(
-          `SELECT count(*)::text AS n FROM wager_transactions WHERE idempotency_key = ANY(?::text[]) AND status = 'PROCESSED'`,
-          [`{${keys.map((k) => `"${k}"`).join(',')}}`],
-        );
-      return Number(row?.n) === keys.length || undefined;
-    }, 30_000, 200);
-    const allProcessedMs = Math.round(performance.now() - sentAt);
+    sender.stdin.write('go\n');
+    await sender.stdin.end();
+    const done = (await lines.next()).value;
+    expect(await sender.exited).toBe(0);
+    expect(done?.processed).toBe(keys.length);
+    const allProcessedMs = done!.allProcessedMs!;
     // uma mensagem presa no poll da vítima só voltaria após o visibility timeout (90 s)
     expect(allProcessedMs).toBeLessThan(20_000);
     for (const w of wallets) expect(await walletBalance(orm, w.id)).toBe('97.00');
