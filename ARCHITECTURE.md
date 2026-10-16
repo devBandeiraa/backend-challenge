@@ -7,7 +7,7 @@ Este documento registra **o que** foi decidido, **por quê**, o que foi trocado 
 **Sumário**
 1. [Visão geral](#1-visão-geral)
 2. [Rastreabilidade: requisito → prova](#2-rastreabilidade-requisito--prova)
-3. [Decisões centrais](#3-decisões-centrais) (destaque: [B](#b--uma-única-reversão-efetiva-por-referência-mais-restrito-que-o-enunciado))
+3. [Decisões centrais](#3-decisões-centrais) (destaque: [B](#b--uma-única-reversão-efetiva-por-referência-mais-restrito-que-o-enunciado); ORM: [I](#i--mikroorm-o-que-é-usado-e-o-que-é-contornado-de-propósito))
 4. [Domínio e regras de negócio](#4-domínio-e-regras-de-negócio) (desvios do enunciado: [4.5](#45-desvios-e-interpretações-do-enunciado))
 5. [Persistência, concorrência e integridade no schema](#5-persistência-concorrência-e-integridade-no-schema)
 6. [Idempotência](#6-idempotência)
@@ -217,6 +217,41 @@ O limite de tentativas vale para PENDING_REFERENCE (seção [7.4](#74-worker-de-
 - **Ledger:** paginado em ordem decrescente de `wallet_version`.
 - **Testes:** usam ids próprios, sem `TRUNCATE`, que o ledger bloqueia.
 
+
+### I — MikroORM: o que é usado e o que é contornado de propósito
+
+**A escolha.** O enunciado (§4) aceita MikroORM (preferencial) ou TypeORM. Fiquei com o MikroORM pelo que ele deixa
+**explícito**: cada unidade de trabalho é um `EntityManager` próprio (`fork`), a transação tem fronteira clara
+(`em.transactional()`) com nível de isolamento declarado, e o lock é parte da consulta (`LockMode`). O TypeORM resolve o
+mesmo com `QueryRunner`, mas o escopo do gerenciador e o cache de entidades ficam menos visíveis no código.
+
+**O que é usado, e para quê:**
+
+| Recurso | Onde | Por quê |
+|---|---|---|
+| **Unit of Work = `em.fork()` por tentativa** | [mikro-orm-unit-of-work.ts](src/infrastructure/persistence/mikro-orm-unit-of-work.ts) | cada tentativa da transação (e cada retry por `40P01`/`55P03`) nasce num EntityManager limpo: nenhum estado de uma tentativa abortada vaza para a seguinte. A porta `UnitOfWork` da aplicação é essa classe; os use cases não conhecem o ORM |
+| **`em.transactional()`** com `IsolationLevel.READ_COMMITTED` | idem; [outbox-publisher.ts](src/infrastructure/workers/outbox-publisher.ts) | delimita a transação SQL única de inbox + transação + wallet + ledger + outbox (§6.5, §11), com `SET LOCAL` de `lock_timeout`/`statement_timeout` no início. A serialização vem do lock, não do isolamento (§5.3) |
+| **`LockMode.PESSIMISTIC_PARTIAL_WRITE`** (`FOR UPDATE SKIP LOCKED`) | outbox publisher, worker de PENDING_REFERENCE ([repositories.ts](src/infrastructure/persistence/repositories.ts)) | N instâncias dividem o trabalho sem coordenação: cada uma reivindica linhas diferentes e nenhuma espera a outra |
+| **`defineEntity` + mapeadores** | [schemas/records.ts](src/infrastructure/persistence/schemas/records.ts), [mappers.ts](src/infrastructure/persistence/mappers.ts) | os registros de persistência ficam fora do domínio (§6.1: o domínio não depende do ORM nem de decorators). O domínio é reidratado por `rehydrate` |
+| **`p.decimal('string')`** | records.ts | `NUMERIC(19,2)` chega e sai como string; o valor nunca passa por `number` entre o banco e o `Money` |
+| **Migrator** com `migrationsList` explícita, `transactional` e `allOrNothing` | [mikro-orm.config.ts](src/infrastructure/persistence/mikro-orm.config.ts) | migrations versionadas e reversíveis; ordem determinística, a mesma no host e na imagem |
+| **Exceções convertidas** (`UniqueConstraintViolationException`, `DriverException`) | [pg-errors.ts](src/infrastructure/persistence/pg-errors.ts) | classificação por SQLSTATE/constraint, preservada pelo MikroORM nas exceções |
+
+**O que é contornado de propósito, e por quê:**
+- **Identity Map nas leituras** (`disableIdentityMap: true`): a wallet é lida **depois** do lock (`FOR NO KEY UPDATE`). Uma
+  entidade em cache seria o saldo de antes da espera, exatamente o lost update que o lock evita. Com o fork por tentativa,
+  o identity map também não traria ganho entre tentativas.
+- **`flush` e o change set automático nas escritas** (`em.insert`/`nativeUpdate` em vez de `persist` + `flush`):
+  1. **a ordem é parte das invariantes**: a transação vai para PROCESSED **antes** do lançamento (o trigger WL005 confere
+     o status), a wallet antes do lançamento (encadeamento WL002 e o deferred WL004). O `flush` ordena pelo grafo de
+     dependências das entidades, não por essas regras;
+  2. **insert-first com `INSERT ... ON CONFLICT DO NOTHING`** (decisão C) e **`FOR NO KEY UPDATE`** (decisão A) não são
+     expressáveis pelo change set nem pelo `LockMode` (que só gera `FOR UPDATE`);
+  3. **o domínio não é entidade do ORM**: as transições ficam encapsuladas nas classes de domínio, e o repositório grava só
+     as colunas mutáveis (`mutableTxFields`), as mesmas que o GRANT da app permite atualizar (migration 008).
+- **Custo da escolha:** sem cálculo automático de change set nem agrupamento de inserts pelo ORM. Em troca, cada comando SQL
+  de uma transação financeira está escrito, em ordem, no caso de uso ou no repositório, sem query escondida.
+
 ---
 
 ## 4. Domínio e regras de negócio
@@ -402,7 +437,7 @@ ainda o usar. Tabela nova numa migration futura precisa de `GRANT` explícito.
   em vez de uma espera curta.
 - **Escritas:** nativas (`em.insert`/`nativeUpdate`) em vez de `flush`. A ordem dos comandos importa
   (FKs e trigger de encadeamento) e fica explícita. `em.transactional` delimita a transação.
-  As leituras usam `disableIdentityMap`.
+  As leituras usam `disableIdentityMap`. Justificativa completa na decisão [I](#i--mikroorm-o-que-é-usado-e-o-que-é-contornado-de-propósito).
 - **Retry da unit of work:** repete a transação inteira para `40001`, `40P01`, `55P03` e para violação de
   `wt_single_reversal_uq` (uma corrida perdida; na nova tentativa a regra devolve `REFERENCE_ALREADY_REVERSED`).
   - Até 5 tentativas, com backoff de 10–200 ms e jitter, cada uma num `fork` novo do EntityManager.
