@@ -16,8 +16,10 @@ export interface AppConfig {
     statementTimeoutMs: number;
     /** Watchdog do cliente: query sem resposta além disso destrói a conexão (pg-pool-resilience.ts). */
     queryTimeoutMs: number;
-    /** Teto para abrir conexão e para esperar vaga no pool. */
+    /** Teto para abrir conexão. */
     connectTimeoutMs: number;
+    /** Teto para esperar vaga no pool (fila legítima numa hot wallet; nunca infinito). */
+    acquireTimeoutMs: number;
     uowMaxAttempts: number;
   };
   sqs: {
@@ -74,6 +76,7 @@ export function loadConfig(): AppConfig {
     throw new Error(`DB_QUERY_TIMEOUT_MS (${queryTimeoutMs}) must be greater than DB_STATEMENT_TIMEOUT_MS (${statementTimeoutMs})`);
   }
   const connectTimeoutMs = num('DB_CONNECT_TIMEOUT_MS', 5_000);
+  const acquireTimeoutMs = num('DB_POOL_ACQUIRE_TIMEOUT_MS', 30_000);
   const uowMaxAttempts = num('UOW_MAX_ATTEMPTS', 5);
   const waitTimeSeconds = num('SQS_WAIT_TIME_SECONDS', 10);
   const timing = { lockTimeoutMs, statementTimeoutMs, queryTimeoutMs, uowMaxAttempts };
@@ -92,6 +95,7 @@ export function loadConfig(): AppConfig {
       statementTimeoutMs,
       queryTimeoutMs,
       connectTimeoutMs,
+      acquireTimeoutMs,
       uowMaxAttempts,
     },
     sqs: {

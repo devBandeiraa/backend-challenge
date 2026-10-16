@@ -4,7 +4,9 @@ interface PoolClient {
   on(event: 'error', listener: (error: Error) => void): unknown;
   query: (...args: unknown[]) => unknown;
 }
+type ClientClass = new (config: Record<string, unknown>) => object;
 interface Pool {
+  Client: ClientClass;
   on(event: 'error', listener: (error: Error) => void): unknown;
   on(event: 'connect', listener: (client: PoolClient) => void): unknown;
 }
@@ -17,8 +19,10 @@ interface Pool {
  * servidor. O cliente ficava "emprestado" para sempre, o pool enchia e a réplica travava (readiness,
  * consumer e workers) até ser reiniciada, mesmo com o banco de volta.
  *
- *  - connectionTimeoutMillis: teto para abrir conexão e para esperar uma vaga no pool (falha rápida,
- *    vira 503 / retry SQS em vez de pendurar);
+ *  - dois tetos distintos: abrir conexão (`connectTimeoutMs`, curto: servidor fora vira erro rápido) e esperar
+ *    vaga no pool (`acquireTimeoutMs`, generoso: numa hot wallet a fila do pool é espera legítima, e com 5 s
+ *    o hot-wallet de 200 apostas recebia 503). O `pg-pool` usa a MESMA opção para os dois, então o teto de
+ *    conexão é imposto na classe de cliente que o pool instancia;
  *  - keepAlive: o kernel sonda a conexão (no compose, sysctls de keepalive curtos): é o que detecta servidor
  *    morto embaixo da única instrução isenta do watchdog, o lock da wallet (LOCK_WAIT_MARKER);
  *  - watchdog de query: query sem resposta além de `queryTimeoutMs` DESTRÓI a conexão. Assim a query
@@ -35,7 +39,10 @@ interface Pool {
  *    próprio pool; sem listener, o evento derrubaria o processo.
  */
 export interface PoolResilienceOptions {
+  /** Abrir a conexão TCP + handshake com o Postgres. */
   connectTimeoutMs: number;
+  /** Esperar uma vaga no pool (nunca infinito). */
+  acquireTimeoutMs: number;
   /** 0 desliga o watchdog (migrations: DDL longa é legítima). */
   queryTimeoutMs: number;
   applicationName: string;
@@ -44,13 +51,24 @@ export interface PoolResilienceOptions {
 
 export function resilientDriverOptions(options: PoolResilienceOptions) {
   return {
-    connectionTimeoutMillis: options.connectTimeoutMs,
+    // pg-pool: espera por vaga (e, sem o ajuste abaixo, também a abertura de conexão).
+    connectionTimeoutMillis: options.acquireTimeoutMs,
     keepAlive: true,
     keepAliveInitialDelayMillis: 10_000,
     // Conexões ociosas além disso são fechadas: depois de uma queda, o pool não guarda sockets velhos.
     idleTimeoutMillis: 30_000,
     application_name: options.applicationName,
     onPoolCreated(pool: Pool) {
+      // O pool cria clientes com `new pool.Client(pool.options)`: o teto de CONEXÃO é o próprio, mais curto.
+      const BaseClient = pool.Client;
+      pool.Client = class extends BaseClient {
+        constructor(config: Record<string, unknown>) {
+          // Cópia com os descritores: o pg-pool guarda `password` como propriedade NÃO enumerável (spread a perderia).
+          const own = Object.defineProperties({}, Object.getOwnPropertyDescriptors(config)) as Record<string, unknown>;
+          own.connectionTimeoutMillis = options.connectTimeoutMs;
+          super(own);
+        }
+      };
       pool.on('error', (error) => options.onConnectionError?.(error, 'idle'));
       pool.on('connect', (client: PoolClient) => {
         client.on('error', (error) => options.onConnectionError?.(error, 'active'));

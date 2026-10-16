@@ -447,8 +447,11 @@ travadas **para sempre** depois que ele voltava: readiness sem resposta, consume
 - **ROLLBACK/BEGIN em cliente quebrado viram no-op bem-sucedido.** O servidor já desfez a transação quando a conexão
   caiu; o Kysely então devolve o cliente, e o `pg-pool` o descarta porque ele não é "queryable". **COMMIT nunca é
   simulado.**
-- **`connectionTimeoutMillis`** (`DB_CONNECT_TIMEOUT_MS`, 5 s): teto para abrir conexão e para esperar vaga. Falha
-  rápida, que vira 503 / retry SQS.
+- **Dois tetos distintos**, porque o `pg-pool` usa a mesma opção (`connectionTimeoutMillis`) para os dois:
+  - abrir conexão (`DB_CONNECT_TIMEOUT_MS`, 5 s): servidor fora vira erro rápido, 503 / retry SQS. Imposto na classe de
+    cliente que o pool instancia;
+  - esperar vaga no pool (`DB_POOL_ACQUIRE_TIMEOUT_MS`, 30 s): numa hot wallet, a fila do pool é espera legítima. A 1ª
+    versão usava 5 s para os dois e o hot-wallet de 200 apostas recebeu 503 na espera por vaga. Nunca é infinito.
 - **Watchdog de query** (`DB_QUERY_TIMEOUT_MS`, padrão `statement_timeout` + 3 s = 18 s): query sem resposta além
   disso **destrói a conexão**, então ela rejeita com erro de conexão (transitório) e o pool descarta o cliente. O
   `query_timeout` nativo do `pg` não serve: ele rejeita a query mas mantém o cliente preso e o pool o reaproveita.

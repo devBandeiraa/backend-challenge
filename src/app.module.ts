@@ -181,6 +181,7 @@ const messaging = [
           clientUrl: db.url,
           poolMax: db.poolMax,
           connectTimeoutMs: db.connectTimeoutMs,
+          acquireTimeoutMs: db.acquireTimeoutMs,
           queryTimeoutMs: db.queryTimeoutMs,
           applicationName: `${APP_APPLICATION_NAME_PREFIX}${instanceId}`.slice(0, 63),
           onConnectionError: (error, state) => poolLogger.warn({ msg: 'database connection error; client discarded', state, err: error }),

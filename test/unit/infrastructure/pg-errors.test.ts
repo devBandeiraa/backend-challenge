@@ -14,6 +14,8 @@ describe('classificação de erros do banco', () => {
     ['DriverException "not queryable" (sem SQLSTATE)', new DriverException(new Error('Client has encountered a connection error and is not queryable'))],
     ['Error "Connection terminated unexpectedly"', new Error('Connection terminated unexpectedly')],
     ['pg-pool: timeout de aquisição', new Error('timeout exceeded when trying to connect')],
+    ['pg: timeout ao abrir a conexão', new Error('timeout expired')],
+    ['pg: conexão encerrada por timeout', new Error('Connection terminated due to connection timeout')],
     ['watchdog de query', new Error('query exceeded 18000 ms without a response: connection destroyed')],
     ['DriverException sem SQLSTATE e mensagem desconhecida', new DriverException(new Error('something odd in the socket'))],
     ['ConnectionException', new ConnectionException(new Error('boom'))],

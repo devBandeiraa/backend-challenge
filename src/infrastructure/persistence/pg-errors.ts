@@ -56,7 +56,7 @@ export function constraintOf(error: unknown): string | undefined {
  * casos em que o erro nem passa pelo driver do MikroORM (pg-pool, watchdog de query).
  */
 const CONNECTION_ERROR_MESSAGE =
-  /not queryable|Connection terminated|Connection ended|timeout exceeded when trying to connect|Query read timeout|without a response: connection destroyed|terminating connection|server closed the connection|socket hang up|read ECONNRESET|connect ECONNREFUSED|Client was closed/i;
+  /not queryable|Connection terminated|Connection ended|timeout exceeded when trying to connect|Query read timeout|without a response: connection destroyed|terminating connection|server closed the connection|socket hang up|read ECONNRESET|connect ECONNREFUSED|Client was closed|^timeout expired$|connection timeout/i;
 
 /** Erros do driver/ORM (o erro e as causas encadeadas). */
 const DRIVER_ERROR_NAMES = new Set(['DriverException', 'ConnectionException', 'DatabaseError']);

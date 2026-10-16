@@ -6,7 +6,7 @@ import {
   worstCaseMessageProcessingMs,
 } from '../../../src/infrastructure/config';
 
-const db = { url: '', poolMax: 10, lockTimeoutMs: 5_000, statementTimeoutMs: 15_000, queryTimeoutMs: 18_000, connectTimeoutMs: 5_000, uowMaxAttempts: 5 };
+const db = { url: '', poolMax: 10, lockTimeoutMs: 5_000, statementTimeoutMs: 15_000, queryTimeoutMs: 18_000, connectTimeoutMs: 5_000, acquireTimeoutMs: 30_000, uowMaxAttempts: 5 };
 // defaults do compose: long poll de 5 s, SHUTDOWN_GRACE_MS 60 s
 const sqs = (visibilityTimeoutSeconds: number, shutdownGraceMs = 60_000, waitTimeSeconds = 5) =>
   ({ visibilityTimeoutSeconds, shutdownGraceMs, waitTimeSeconds }) as never;

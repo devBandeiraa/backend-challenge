@@ -8,8 +8,10 @@ import { entities } from './schemas';
 export interface OrmConfigOverrides {
   clientUrl?: string;
   poolMax?: number;
-  /** Teto para abrir conexão e para esperar vaga no pool (DB_CONNECT_TIMEOUT_MS). */
+  /** Teto para abrir conexão (DB_CONNECT_TIMEOUT_MS). */
   connectTimeoutMs?: number;
+  /** Teto para esperar vaga no pool (DB_POOL_ACQUIRE_TIMEOUT_MS). */
+  acquireTimeoutMs?: number;
   /** Watchdog de query sem resposta (DB_QUERY_TIMEOUT_MS); 0 desliga (migrations). */
   queryTimeoutMs?: number;
   /** application_name no Postgres: identifica réplicas, testes e migrations em pg_stat_activity. */
@@ -31,6 +33,7 @@ export function buildOrmConfig(overrides: OrmConfigOverrides = {}) {
     pool: { min: 0, max: overrides.poolMax ?? Number(process.env.DB_POOL_MAX ?? 10) },
     driverOptions: resilientDriverOptions({
       connectTimeoutMs: overrides.connectTimeoutMs ?? envNumber('DB_CONNECT_TIMEOUT_MS', 5_000),
+      acquireTimeoutMs: overrides.acquireTimeoutMs ?? envNumber('DB_POOL_ACQUIRE_TIMEOUT_MS', 30_000),
       queryTimeoutMs: overrides.queryTimeoutMs ?? envNumber('DB_QUERY_TIMEOUT_MS', statementTimeoutMs + 3_000),
       applicationName: overrides.applicationName ?? 'wagering',
       ...(overrides.onConnectionError ? { onConnectionError: overrides.onConnectionError } : {}),
